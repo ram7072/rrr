@@ -1,0 +1,292 @@
+Task -
+Extract GR records and merge with merge_json fro all sources:
+1) What is the parameterization required - ML_Attribute
+2) Which collection we would need it in - domain-registration-schema
+3) What is the key-value pair for each of that parameterization- "ML_Attribute:
+{
+"First_Name: "Simple",
+"Phone" : "Simple_Multivalued",
+"Address" : {
+"type": "Complex_Multivalued",
+"Primary_Address" : ["Type1", "Type2"],
+"Professional_Address" : ["Type3", "Type4"]
+}
+}
+4) Any specific flag we are checking from any specific collection in our code. - NA
+---------------------------------------------------------------------------------------------------
+
+Task - 
+File level standardisation
+1) What is the parameterization required - sourcename,sourceid,domainid,bucketpath,username
+2) Which collection we would need it in - source-registration-schema
+3) What is the key-value pair for each of that parameterization- 
+{
+"sourceId": "PRE01",
+"sourceName": "Siebel",
+"mandatory-attributes": {
+	"First_Name": {
+		"dataType": "string"
+	},
+	"Middle_Name": {
+		"dataType": "string"
+	},
+	"Last_Name": {
+		"dataType": "string"
+	},
+
+},
+"folder-structure": {
+	"input-folder": "input/",
+	"error-folder": "error/",
+	"validated-folder": "validated/",
+	"archive-folder": "archive/"
+    }
+}
+4) Any specific flag we are checking from any specific collection in our code. - NA
+--------------------------------------------------------------------------------------------
+
+Task
+Grad_Rule:
+----------
+1. All_Values:
+
+	parameterization required 	: attribute_name, domain_id, guid_id
+	Collection Name needed: guid_repo, source_reg_schema
+	Key-value pair for each of that parameterization: Mentioned below collection
+	Any specific flag we are checking from any specific collection in our code: NO
+
+2. Source_priority:
+	parameterization required 	: attribute_name, domain_id, guid_id
+	Collection Name needed: guid_repo, source_reg_schema
+	Key-value pair for each of that parameterization: Mentioned below collection
+	Any specific flag we are checking from any specific collection in our code: NO
+	
+2. Sum of ALL:
+
+	parameterization required 	: attribute_name, domain_id, guid_id
+	ollection Name needed: guid_repo, source_reg_schema
+	Key-value pair for each of that parameterization: Mentioned below collection	 
+	Any specific flag we are checking from any specific collection in our code: NO
+	
+3. Y if one is Y:
+	parameterization required 	: attribute_name, domain_id, guid_id
+	Collection Name needed: guid_repo, source_reg_schema
+	Key-value pair for each of that parameterization: Mentioned below collection		 
+	Any specific flag we are checking from any specific collection in our code: NO
+	
+4. N if one is N: 
+	parameterization required 	: attribute_name, domain_id, guid_id
+	Collection Name needed: guid_repo, source_reg_schema
+	Key-value pair for each of that parameterization: Mentioned below collection		 
+	Any specific flag we are checking from any specific collection in our code: NO
+
+grad_rule collection:-
+[{
+"_id": {
+"$oid": "61309a8afb5e8b3d8eaf6a80"
+},
+"domain": "person",
+"gradRules": {
+"Fname": {
+"Rule": "SourcePriority",
+"Priority1": "Siebel",
+"Priority2": "Marketto",
+"Priority3": "Author",
+"Priority4": "CEEvents",
+"Priority5": "OpenWater",
+"Priority6": "Reviewer"
+},
+"Lname": {
+"Rule": "SourcePriority",
+"Priority1": "Siebel",
+"Priority2": "Marketto",
+"Priority3": "Author",
+"Priority4": "CEEvents",
+"Priority5": "Editor"
+},
+"Email": {
+"Rule": "AllValues"
+},
+"Phone": {
+"Rule": "AllValues"
+},
+"isMember": {
+"Rule": "Y_if_anyone_is_Y"
+},
+"okToCall": {
+"Rule": "N_if_anyone_is_N"
+},
+"Publication": {
+"Rule": "sumOfAll"
+}
+}
+}]
+-------------------------------------------------------------------------------------------
+
+Task
+predisambiguation audit log
+1)parameterization required : domain_id,username,processid,sessionid 
+2)Collection Name needed: Domain master, audit process, source_reg_schema, session_schema
+3)Key-value pair for each of that parameterization: Mentioned below collection
+source-registration-schema required attributes:--
+{
+"sourceId": "PER1"
+"domain": 
+		{
+        "domainId": "PRO2",
+		"ingestionStatus": "READY_FOR_INGESTION"
+		}
+}
+domain-master required attributes:--
+{
+"s3Bucket": "513977-advance-analytical",
+"domain_id": "PRO2"
+}
+audit-process-schema required attributes:--
+{
+    "processid": 1,
+    "processname": "ingestion",
+    "frequency": "daily",
+    "createdate": "2021-10-13",
+    "createdbyuser": "saurav",
+    "updatedate": "2021-10-13",
+    "updatedbyuser": "saurav",
+    "isactive": 0,
+    "domainId": "PRO2"
+}
+session-process-schema required attributes:--
+{
+	SessionID	
+	Process ID	
+	Session Run Date	
+	Start Time	
+	End Time	
+	Is Running	
+	Create Date	
+	Created By User	
+	Valid Source File	
+	Invalid Source File	
+	Valid Source Records(Source & Record Counts)	
+	InValid Source Records(Source & Record Counts)	
+	No Of Groups Created
+}
+4)Any specific flag we are checking from any specific collection in our code: NO
+-------------------------------------------------------------------------------------------------
+
+Task
+postMldismabiguation audit log: (IN PROGRESS) may requir further changes
+1)parameterization required : domain_id,username,processid,sessionid 
+2)Collection Name needed: Domain master, audit process, source_reg_schema, session_schema
+3)Key-value pair for each of that parameterization: 
+4)Any specific flag we are checking from any specific collection in our code: NO
+--------------------------------------------------------------------------------------------------
+
+Task
+Update only flow:
+1)parameterization required : domain_id,username,processid,sessionid 
+2)Collection Name needed: Domain master, audit process, source_reg_schema, session_schema
+3)Key-value pair for each of that parameterization: Mentioned below collection
+source-registration-schema required attributes:--
+{
+"sourceId": "PER1"
+"domain": 
+		{
+        "domainId": "PRO2",
+		"ingestionStatus": "READY_FOR_INGESTION"
+		}
+}
+domain-master required attributes:--
+{
+"s3Bucket": "513977-advance-analytical",
+"domain_id": "PRO2"
+}
+audit-process-schema required attributes:--
+{
+    "processid": 1,
+    "processname": "ingestion",
+    "frequency": "daily",
+    "createdate": "2021-10-13",
+    "createdbyuser": "saurav",
+    "updatedate": "2021-10-13",
+    "updatedbyuser": "saurav",
+    "isactive": 0,
+    "domainId": "PRO2"
+}
+session-process-schema required attributes:--
+{
+	SessionID	
+	Process ID	
+	Session Run Date	
+	Start Time	
+	End Time	
+	Is Running	
+	Create Date	
+	Created By User	
+	Valid Source File	
+	Invalid Source File	
+	Valid Source Records(Source & Record Counts)	
+	InValid Source Records(Source & Record Counts)	
+	No Of Groups Created
+}
+4)Any specific flag we are checking from any specific collection in our code: NO
+-----------------------------------------------------------------------------------------------
+
+Task
+Grouping: (IN PROGRESS)
+1)parameterization required : dataframe 
+2)Collection Name needed: Domain master, audit process, source_reg_schema, session_schema
+3)Key-value pair for each of that parameterization: 
+{
+"domainId": "p1111",
+"domainName": "Person",
+"attributes": [{
+"name": "first_name",
+"datatype": "string",
+"isNull": "False",
+"keyfield": "False",
+"validation": "NotRequired",
+"format": "r'[a-zA-Z]+",
+"columnOrder": 3
+}, {
+"name": "middle_name",
+"datatype": "string",
+"isNull": "False",
+"keyfield": "False",
+"validation": "NotRequired",
+"format": "r'[a-zA-Z]+",
+"columnOrder": 4
+}],
+"grouping": {
+"level1": {
+"criteria": "last_name",
+"upper_limit": 1000,
+"lower_limit": 2
+},
+"level2": {
+"criteria": "first_name",
+"lower_limit": 2,
+"upper_limit": 1000
+},
+"path": {
+"root_path": "D:/grouping/",
+"target_path": "single_file/"
+},
+"prefix": {
+"l1_file_prefix": "L1_2-999_",
+"l1_file_prefix1": "L1_1K+",
+"l1_file_prefix2": "L1_Unique_",
+"l2_file_prefix": "L2_2-999_",
+"l2_file_prefix1": "L2_1K+_",
+"l2_file_prefix2": "L2_Unique_",
+"l2_u_prefix": "L2_U_2-999_",
+"l2_u_prefix1": "L2_U_1K+_",
+"l2_u_prefix2": "L2_U_Unique_"
+},
+"src_file_name": "'source/u/*.csv",
+"src_file_ext": ".csv",
+"tgt_file_ext": ".csv"
+}
+}
+4)Any specific flag we are checking from any specific collection in our code: NO
+
+

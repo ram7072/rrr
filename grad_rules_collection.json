@@ -1,0 +1,44 @@
+[{
+  "_id": "61309a8afb5e8b3d8eaf6a80",
+  "domain":"person",
+  "domainId" : "per-01",
+  "gradRules": {
+      "Active IEEE Member Y/N" :{"Rule" :  "Y_if_anyone_is_Y"},
+	  "Active Subscriptions":{ "Rule" :  "AllValues" },
+	  "Address":{"Rule" :  "AllValues"},
+	  "Adverse Record Exists Y/N":{"Rule" :  "Y_if_anyone_is_Y"},
+	  "Affiliated Company or Organization":{"Rule" :  "AllValues"},
+	  "Collabratec User Y/N":{"Rule" :  "Active_if_anyone_is_Active"},
+	  "Consents and Subscriptions":{"Rule" :  "Y_if_anyone_is_Y"},
+	  "Year of Birth":{"Rule" :  "LatestValue"},
+	  "Education History":{"Rule" :  "AllValues"},
+	  "Email Addresses":{"Rule" :  "AllValues"},
+	  "First Name":{
+		"Rule": "SourcePriority",
+			  "Priority1":{"Rule" :  "Siebel"},
+			  "Priority2":{"Rule" :  "Marketto"},
+			  "Priority3":{"Rule" :  "Author"},
+			  "Priority4":{"Rule" :  "CEEvents"},
+			  "Priority5":{"Rule" :  "OpenWater"},
+			  "Priority6":{"Rule" :  "Reviewer"}
+      },
+	  "Last Name":{
+		  "Rule": "SourcePriority",
+		  "Priority1":{"Rule" :  "Siebel"},
+		  "Priority2":{"Rule" :  "Marketto"},
+		  "Priority3":{"Rule" :  "Author"},
+		  "Priority4":{"Rule" :  "CEEvents"},
+		  "Priority5":{"Rule" :  "OpenWater"},
+		  "Priority6":{"Rule" :  "Reviewer"}
+		},
+	  "IEEE Geo Region":{"Rule" : "SourcePriority"},
+	  "IEEE Member Grade":{"Rule" :  "SourcePriority"},
+	  "Job Title":{"Rule" :  "Latest"},
+	  "Phones":{"Rule" :  "SourcePriority/MostRecent"},
+	  "Product":{"Rule" :  "AllValues"},
+	  "Resides in OFAC Country Y/N":{"Rule" :  "Y_if_anyone_is_Y"},
+	  "Siebel Customer #":{"Rule" : "AllValues" },
+	  "SA Working Group Participation":{"Rule" : "AllValues" },
+	  "Volunteer Positions":{"Rule" : "AllValues" }
+  }
+}]
