@@ -1,0 +1,3 @@
+http://docs.treasuredata.com/articles/hive
+http://gethue.com/hadoop-tutorials-ii-2-execute-hive-queries-and/
+http://www.orzota.com/hive-tutorial-for-beginners/
