@@ -1,0 +1,1 @@
+{"group":"PGE_PROD_DATALAKE", "project":"SNOWFLAKE_DATALAKE", "version":"default", "environment":"Prod", "job":"orch_bat_master_monthly"}

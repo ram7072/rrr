@@ -1,0 +1,76 @@
+{
+  "Version": "2012-10-17",
+  "Id": "arn:aws:sqs:us-west-2:554931768202:DataLake_ETL_Launchpad_Snowflake/SQSDefaultPolicy",
+  "Statement": [
+    {
+      "Sid": "AWSEvents_DL_MTLN_SQS_MeterEvents_snowflake_Id7688358513495",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "events.amazonaws.com"
+      },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-west-2:554931768202:DataLake_ETL_Launchpad_Snowflake",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "arn:aws:events:us-west-2:554931768202:rule/DL_MTLN_SQS_MeterEvents_snowflake"
+        }
+      }
+    },
+    {
+      "Sid": "AWSEvents_DL_MTLN_TRIGGER_TASK_CHECK_Id7311149927988",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "events.amazonaws.com"
+      },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-west-2:554931768202:DataLake_ETL_Launchpad_Snowflake",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "arn:aws:events:us-west-2:554931768202:rule/DL_MTLN_TRIGGER_TASK_CHECK"
+        }
+      }
+    },
+    {
+      "Sid": "AWSEvents_DL_MTLN_TRIGGER_PIPE_CHECK_Id7652002640791",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "events.amazonaws.com"
+      },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-west-2:554931768202:DataLake_ETL_Launchpad_Snowflake",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "arn:aws:events:us-west-2:554931768202:rule/DL_MTLN_TRIGGER_PIPE_CHECK"
+        }
+      }
+    },
+    {
+      "Sid": "AWSEvents_DL_MTLN_SQS_Meter_Customer_Master_snowflake_Id7331572851280",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "events.amazonaws.com"
+      },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-west-2:554931768202:DataLake_ETL_Launchpad_Snowflake",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "arn:aws:events:us-west-2:554931768202:rule/DL_MTLN_SQS_Meter_Customer_Master_snowflake"
+        }
+      }
+    },
+	{
+      "Sid": "AWSEvents_DL_MTLN_SQS_MASTER_MONTHLY",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "events.amazonaws.com"
+      },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-west-2:554931768202:DataLake_ETL_Launchpad_Snowflake",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "arn:aws:events:us-west-2:554931768202:rule/DL_MTLN_SQS_MASTER_MONTHLY"
+        }
+      }
+    }
+  ]
+}

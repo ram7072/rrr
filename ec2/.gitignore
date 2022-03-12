@@ -1,0 +1,15 @@
+.terraform
+secrets.tfvars
+.envrc
+Gemfile.lock
+terraform.tfstate*
+*.swp
+generated.tfvars
+*plan.txt
+secrets.auto.tfvars
+inspec/vendor
+inspec/inspec.lock
+tfjson
+integration-test/Gopkg.lock
+integration-test/Gopkg.toml
+integration-test/vendor

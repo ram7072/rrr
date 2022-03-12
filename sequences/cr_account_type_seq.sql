@@ -1,1 +1,0 @@
-create or replace sequence  finance.cr_account_type_seq  start with -9223372036854775807 increment = 1;
