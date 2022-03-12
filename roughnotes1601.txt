@@ -1,0 +1,2112 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark import SparkConf, SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from py4j.java_gateway import java_import
+from pyspark.sql import functions as F
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import boto3
+from botocore.config import Config
+conn = boto.s3.connect_to_region('eu-west-1', calling_format=boto.s3.connection.OrdinaryCallingFormat())
+
+my_config = Config(
+    region_name = 'us-west-2',
+    signature_version = 'v4',
+    retries = {
+        'max_attempts': 10,
+        'mode': 'standard'
+    }
+)
+
+sc = SparkContext("local", "Simple App")
+spark = SQLContext(sc)
+spark_conf = SparkConf().setMaster('local').setAppName('<YOUR_APP_NAME>')
+
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+## @params: [JOB_NAME, URL, ACCOUNT, WAREHOUSE, DB, SCHEMA, USERNAME, PASSWORD]
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'URL', 'ACCOUNT', 'WAREHOUSE', 'DB', 'SCHEMA', 'USERNAME', 'PASSWORD'])
+
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+java_import(spark._jvm, "SNOWFLAKE_SOURCE_NAME")
+
+## uj = sc._jvm.net.snowflake.spark.snowflake
+spark._jvm.net.snowflake.spark.snowflake.SnowflakeConnectorUtils.enablePushdownSession(spark._jvm.org.apache.spark.sql.SparkSession.builder().getOrCreate())
+sfOptions = {
+"sfURL" : args['URL'],
+"sfAccount" : args['ACCOUNT'],
+"sfUser" : args['USERNAME'],
+"sfPassword" : args['PASSWORD'],
+"sfDatabase" : args['DB'],
+"sfSchema" : args['SCHEMA'],
+"sfWarehouse" : args['WAREHOUSE']
+
+}
+print("Success")
+read_data = "(SELECT * FROM PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP ') as t"
+#df=spark.read.format('jdbc').options(
+         #url='pgedevdatalake.snowflakecomputing.com',
+         #dbtable=read_data ,
+         #user='olap',
+         #password='K1ngK0ng#'
+         #).load()
+#df = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", "PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP").load()
+#query= ''' SELECT DISTINCT BANK_OBJECTID FROM PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP ''';
+
+#bike= """select   BANK_OBJECTID from  PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP limit 10"""
+#sql3="""select customer_name, sum(demand_amt) as total_spent from {0} GROUP BY  customer_name""".format(tbl1)
+def load_query(xfmr):
+    return f"""SELECT u.HOURLY_USAGE,
+                   u.USAGE_DATE_BEGINNING,
+                   u.USAGE_HOUR_BEGINNING,
+                   h.BANK_OBJECTID,
+                   h.LABELTEXT,
+                   t.RATEDKVA,
+                   (u.HOURLY_USAGE/ (CAST(t.RATEDKVA AS int))) AS ratio
+            FROM (SELECT DISTINCT BANK_OBJECTID,
+                                  LABELTEXT
+                  FROM WAREHOUSE.HUB_GIS_ASSET_MAP
+                  WHERE BANK_OBJECTID = {xfmr}) h,
+                  GEOSPATIAL.TRANSFORMER t,
+                  WAREHOUSE.TRANSFORMER_USAGE_HOURLY u
+            WHERE h.LABELTEXT = t.LABELTEXT
+                  AND u.XFMR_BANKID = h.BANK_OBJECTID
+                  AND u.USAGE_DATE_BEGINNING >= '2018-06-01'
+            ORDER BY u.USAGE_DATE_BEGINNING, u.USAGE_HOUR_BEGINNING
+            """
+def get_load(xfmr):
+    print("the sam")
+    load1 = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",load_query(xfmr)).load()
+    a=load1.select([F.col(x).alias(x.lower()) for x in load1.columns])
+    
+    print(type(load1))
+    b=a.toPandas()
+    print(type(b))
+    #load1.show()
+    #load1['dttm'] = pd.to_datetime(load1.usage_date_beginning.astype(str) + ' ' + load1.usage_hour_beginning.astype(str) + ':00:00')
+    b['time_interval'] = 1
+    
+    return b
+def fahrenheit_to_celsius(temp):
+    return (temp - 32)*5/9
+
+### Calculate top oil and winding temperatures
+def top_oil_temp(rise_at_rated_load, load_ratio, ratio_load_loss=2, n=0.8):
+    return rise_at_rated_load*((load_ratio*ratio_load_loss + 1)/(ratio_load_loss + 1))**n
+
+def winding_temp(rise_at_rated_load, load_ratio, m=0.8):
+  return (rise_at_rated_load)*(load_ratio**((2*m)))
+
+### Calculate rise over ambient temperature
+def rise_over_ambient_temp(ultimate_temp, init_temp, time_constant, time_interval):
+    return (ultimate_temp - init_temp)*(1 - np.exp(-time_interval/time_constant)) + init_temp
+
+def calculate_temp(xfmr_part, load_ratio, time_interval, time_constant, rise_at_rated_load):
+    if xfmr_part not in ['winding', 'topoil']:
+        raise ValueError('xfmr_part must be one of "winding" or "topoil"')
+    
+    if xfmr_part == 'winding':
+      ultimate_temp = winding_temp(rise_at_rated_load=rise_at_rated_load,
+                                     load_ratio=load_ratio)							 
+    else:
+        ultimate_temp = top_oil_temp(rise_at_rated_load=rise_at_rated_load,
+                                     load_ratio=load_ratio)
+    
+    temp_0 = load_ratio.iloc[0]
+    init_temp = ultimate_temp.shift(1, fill_value=temp_0)
+    
+    return rise_over_ambient_temp(ultimate_temp=ultimate_temp,
+                                  init_temp=init_temp,
+                                  time_interval=time_interval,
+                                  time_constant=time_constant)
+
+### Get winding & top oil rise over ambient
+def get_temps(load, capacity, time_interval, winding_time_constant=4/60, oil_time_constant=180/60, to_rise_at_rated_load=52.82, w_rise_at_rated_load=15.96):
+    load_ratio = (load/capacity).astype('float')
+    
+    w_temp = calculate_temp(xfmr_part='winding',
+                            load_ratio=load_ratio,
+                            time_interval=time_interval,
+                            time_constant=winding_time_constant,
+                            rise_at_rated_load=w_rise_at_rated_load)
+
+    to_temp = calculate_temp(xfmr_part='topoil',
+                             load_ratio=load_ratio,
+                             time_interval=time_interval,
+                             time_constant=oil_time_constant,
+                             rise_at_rated_load=to_rise_at_rated_load)
+							 
+    return w_temp, to_temp
+
+### Get hotspot temperature
+def hotspot_temp(ambient_temp, top_oil_temp, winding_temp):
+    return ambient_temp + top_oil_temp + winding_temp
+
+### Calculate aging metrics
+def factor_accelerated_aging(hotspot_temp):
+    return np.exp(15000/383 - 15000/(hotspot_temp + 273))
+
+def factor_equivalent_aging(faa):
+    return np.mean(faa)
+
+def loss_of_life(feqa, life_span=180000):
+    return feqa*24*100/life_span
+    
+def main(xfmr):
+    print("Runget_loadning function for ",xfmr )
+    #tym = datetime.now()
+    # Query load data for a given 
+    #load = get_load(xfmr=xfmr)
+    df = get_load(xfmr=xfmr)
+    #df.select([F.col(x).alias(x.lower()) for x in df.columns]).show()
+    # Grab transformer capacity from the query
+    print("raja")
+    print(df)
+    if df["bank_objectid"].count()>0:
+        # Grab transformer capacity from the query
+        capacity = df.ratedkva.iloc[0]
+        # Calculate winding and top oil temperatures from load and capacity
+        
+        df['winding_temp'], df['top_oil_temp'] = get_temps(load=df.hourly_usage,
+                                                           capacity=capacity,
+                                                       time_interval=df.time_interval)
+	
+	    # Calculate hotspot temperature from ambient, winding, and top oil temperatures
+        df['hotspot_temp'] = hotspot_temp(ambient_temp=df.mean_temp.astype('float'),
+                                          winding_temp=df.winding_temp,
+                                          top_oil_temp=df.top_oil_temp)
+        
+        # Calculate hourly accelerated aging from the hotspot temperature
+        df['faa'] = factor_accelerated_aging(df.hotspot_temp)
+        df['faa'] = np.where(df.ratio.abs() > 1,
+                             df.faa,
+                             0)    
+        # Calculate a rolling 24 hour equivalent aging factor
+        df['feqa'] = df.groupby('usage_date_beginning')['faa'].transform('mean')  
+        
+        # Calculate % loss of life
+        df['lol'] = loss_of_life(df.feqa)
+        print(df)
+        return df
+   
+def get_bank_ids():
+        sql= ''' SELECT DISTINCT BANK_OBJECTID FROM WAREHOUSE.HUB_GIS_ASSET_MAP limit 10'''
+        results = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",sql).load()  
+        #r=spark.select(lower(col('BANK_OBJECTID')).alias('bla'))
+        results = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",sql).load()
+        #result=results.select('BANK_OBJECTID').collect()
+        mvv_list = results.selectExpr("BANK_OBJECTID as mvv")
+        mvv_arr = [int(row['mvv']) for row in mvv_list.collect()]
+        fin=[]
+        for i in mvv_arr:
+            fin.append(i)
+        #print(fin)
+        #for col in results.columns:
+            #result = results.withColumn(col, F.lower(F.col(col)))
+            #result=results.select(lower(col('BANK_OBJECTID')))
+            #print(result)
+            #return(result)
+        return(fin)
+#bank_id_df = get_bank_ids()
+for i in get_bank_ids():
+    print(i)
+    main(i)
+-------------------------------
+
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark import SparkConf, SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from py4j.java_gateway import java_import
+from datetime import datetime
+from pyspark.sql import functions as F
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+from json import dumps
+from io import StringIO
+import os
+import pandas as pd
+import numpy as np
+import boto3
+
+sc = SparkContext("local", "Simple App")
+spark = SQLContext(sc)
+spark_conf = SparkConf().setMaster('local').setAppName('<YOUR_APP_NAME>')
+
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+## @params: [JOB_NAME, URL, ACCOUNT, WAREHOUSE, DB, SCHEMA, USERNAME, PASSWORD]
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'URL', 'ACCOUNT', 'WAREHOUSE', 'DB', 'SCHEMA', 'USERNAME', 'PASSWORD'])
+
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+java_import(spark._jvm, "SNOWFLAKE_SOURCE_NAME")
+
+## uj = sc._jvm.net.snowflake.spark.snowflake
+spark._jvm.net.snowflake.spark.snowflake.SnowflakeConnectorUtils.enablePushdownSession(spark._jvm.org.apache.spark.sql.SparkSession.builder().getOrCreate())
+sfOptions = {
+"sfURL" : args['URL'],
+"sfAccount" : args['ACCOUNT'],
+"sfUser" : args['USERNAME'],
+"sfPassword" : args['PASSWORD'],
+"sfDatabase" : args['DB'],
+"sfSchema" : args['SCHEMA'],
+"sfWarehouse" : args['WAREHOUSE']
+
+}
+print("Success")
+read_data = "(SELECT * FROM PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP ') as t"
+#df=spark.read.format('jdbc').options(
+         #url='pgedevdatalake.snowflakecomputing.com',
+         #dbtable=read_data ,
+         #user='olap',
+         #password='K1ngK0ng#'
+         #).load()
+#df = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", "PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP").load()
+#query= ''' SELECT DISTINCT BANK_OBJECTID FROM PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP ''';
+
+#bike= """select   BANK_OBJECTID from  PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP limit 10"""
+#sql3="""select customer_name, sum(demand_amt) as total_spent from {0} GROUP BY  customer_name""".format(tbl1)
+### Query data
+def load_query(xfmr):
+    return f"""
+                with t1 as (
+                        SELECT u.HOURLY_USAGE,
+                            u.USAGE_DATE_BEGINNING,
+                            u.USAGE_HOUR_BEGINNING,
+                            h.BANK_OBJECTID,
+                            h.LABELTEXT,
+                            t.RATEDKVA,
+                            (u.HOURLY_USAGE+1/ (CAST(t.RATEDKVA AS int))) AS ratio,    
+                            dateadd(hour, u.USAGE_HOUR_BEGINNING, u.USAGE_DATE_BEGINNING) as dttma,
+                            current_timestamp as t
+                        FROM (SELECT DISTINCT BANK_OBJECTID,LABELTEXT
+                                FROM WAREHOUSE.HUB_GIS_ASSET_MAP
+                                    WHERE BANK_OBJECTID in ({xfmr})
+                               ) h,
+                            GEOSPATIAL.HG_TRANSFORMER_3 t,
+                            WAREHOUSE.TRANSFORMER_USAGE_HOURLY_1 u
+                                WHERE h.LABELTEXT = t.LABELTEXT
+                                AND u.XFMR_BANKID = h.BANK_OBJECTID
+                                AND u.USAGE_DATE_BEGINNING >= '2018-01-05' 
+                        ),
+                t2 as 
+                (
+                    select dt as dttm , mean_temp from weather.HG_EXT_INPUT_WEATHER_HIST
+                )
+                select * from t1
+                inner join t2 on t1.dttma = t2.dttm
+            """
+
+def get_load(xfmr):
+  
+    load1 = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",load_query(xfmr)).load()
+    a=load1.select([F.col(x).alias(x.lower()) for x in load1.columns])
+    load=a.toPandas()
+    load['time_interval'] = 1    
+    
+    print(load)
+    return load
+
+def fahrenheit_to_celsius(temp):
+    return (temp - 32)*5/9
+
+### Calculate top oil and winding temperatures
+def top_oil_temp(rise_at_rated_load, load_ratio, ratio_load_loss=2, n=0.8):
+    return rise_at_rated_load*((load_ratio*ratio_load_loss + 1)/(ratio_load_loss + 1))**n
+
+def winding_temp(rise_at_rated_load, load_ratio, m=0.8):
+  return (rise_at_rated_load)*(load_ratio**((2*m)))
+
+### Calculate rise over ambient temperature
+def rise_over_ambient_temp(ultimate_temp, init_temp, time_constant, time_interval):
+    return (ultimate_temp - init_temp)*(1 - np.exp(-time_interval/time_constant)) + init_temp
+
+def calculate_temp(xfmr_part, load_ratio, time_interval, time_constant, rise_at_rated_load):
+    if xfmr_part not in ['winding', 'topoil']:
+        raise ValueError('xfmr_part must be one of "winding" or "topoil"')
+    
+    if xfmr_part == 'winding':
+      ultimate_temp = winding_temp(rise_at_rated_load=rise_at_rated_load,
+                                     load_ratio=load_ratio)							 
+    else:
+        ultimate_temp = top_oil_temp(rise_at_rated_load=rise_at_rated_load,
+                                     load_ratio=load_ratio)
+    
+    temp_0 = load_ratio.iloc[0]
+    init_temp = ultimate_temp.shift(1, fill_value=temp_0)
+    
+    return rise_over_ambient_temp(ultimate_temp=ultimate_temp,
+                                  init_temp=init_temp,
+                                  time_interval=time_interval,
+                                  time_constant=time_constant)
+
+### Get winding & top oil rise over ambient
+def get_temps(load, capacity, time_interval, winding_time_constant=4/60, oil_time_constant=180/60, to_rise_at_rated_load=52.82, w_rise_at_rated_load=15.96):
+    load_ratio = (load/capacity).astype('float')
+    
+    w_temp = calculate_temp(xfmr_part='winding',
+                            load_ratio=load_ratio,
+                            time_interval=time_interval,
+                            time_constant=winding_time_constant,
+                            rise_at_rated_load=w_rise_at_rated_load)
+
+    to_temp = calculate_temp(xfmr_part='topoil',
+                             load_ratio=load_ratio,
+                             time_interval=time_interval,
+                             time_constant=oil_time_constant,
+                             rise_at_rated_load=to_rise_at_rated_load)
+							 
+    return w_temp, to_temp
+
+### Get hotspot temperature
+def hotspot_temp(ambient_temp, top_oil_temp, winding_temp):
+    return ambient_temp + top_oil_temp + winding_temp
+
+### Calculate aging metrics
+def factor_accelerated_aging(hotspot_temp):
+    return np.exp(15000/383 - 15000/(hotspot_temp + 273))
+
+def factor_equivalent_aging(faa):
+    return np.mean(faa)
+
+def loss_of_life(feqa, life_span=180000):
+    return feqa*24*100/life_span
+    
+def main(xfmr):
+    
+    
+    
+    tym = datetime.now()
+
+    # Query load data for a given 
+    df = get_load(xfmr)
+    
+    print("Time Taken by Query =", datetime.now() - tym , " seconds.")
+    
+    print("count= ",df["bank_objectid"].count())
+    
+    if df["bank_objectid"].count()>0:
+        # Grab transformer capacity from the query
+        capacity = df.ratedkva.iloc[0]
+        
+        # Calculate winding and top oil temperatures from load and capacity
+        
+        df['winding_temp'], df['top_oil_temp'] = get_temps(load=df.hourly_usage,
+                                                           capacity=capacity,
+                                                       time_interval=df.time_interval)
+	
+	    # Calculate hotspot temperature from ambient, winding, and top oil temperatures
+        df['hotspot_temp'] = hotspot_temp(ambient_temp=df.mean_temp.astype('float'),
+                                          winding_temp=df.winding_temp,
+                                          top_oil_temp=df.top_oil_temp)
+        
+        # Calculate hourly accelerated aging from the hotspot temperature
+        df['faa'] = factor_accelerated_aging(df.hotspot_temp)
+        df['faa'] = np.where(df.ratio.abs() > 1,
+                             df.faa,
+                             0)    
+        # Calculate a rolling 24 hour equivalent aging factor
+        df['feqa'] = df.groupby('usage_date_beginning')['faa'].transform('mean')  
+        
+        # Calculate % loss of life
+        df['lol'] = loss_of_life(df.feqa)
+   
+        print("Time Taken (Query + Other Calculations) =", datetime.now() - tym , " seconds.")
+        print("/***********************************************************/")
+        print("\n")
+        print(df)
+         ## write data to S3
+		bucketName = 'dsm-datalake-s3-bucket-dev'
+		conn = boto.s3.connect_to_region('eu-west-1', calling_format=boto.s3.connection.OrdinaryCallingFormat())
+        bucket = conn.get_bucket(bucketName)
+        bucketName = 'dsm-datalake-s3-bucket-dev'
+        s3_prefix = "Datalake_Raw/Weather/overload_xfmr/mat"
+        dt = datetime.now()
+        datestr = dt.strftime("%Y%m%d")
+        timestr = dt.strftime("%H%M%S%f")
+        fileName = 't_overloaded_xfmr_'+datestr+'_'+timestr+'.csv'
+        #fileName = 't_overloaded_xfmr_'+str(xfmr)+'.csv'
+    
+        file_prefix = "/".join([s3_prefix,fileName])
+
+        csv_buffer = StringIO()
+        df.to_csv(csv_buffer)
+		#client = boto3.client('kinesis', config=my_config)
+    
+        s3_resource = boto3.resource('s3',config=my_config)
+        #s3 = boto3.client('s3', verify=False)
+        s3_resource.Object("bucketName", file_prefix).put(Body=csv_buffer.getvalue())
+        return df
+ 
+def get_bank_ids():
+        sql= ''' SELECT DISTINCT BANK_OBJECTID FROM WAREHOUSE.HUB_GIS_ASSET_MAP limit 100'''
+        results = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",sql).load()
+        #result=results.select('BANK_OBJECTID').collect()
+        mvv_list = results.selectExpr("BANK_OBJECTID as mvv")
+        mvv_arr = [int(row['mvv']) for row in mvv_list.collect()]
+        fin=[]
+        for i in mvv_arr:
+            fin.append(i)
+        return(fin)
+#bank_id_df = get_bank_ids()
+for i in get_bank_ids():
+    print(i)
+    main(i)
+  *********Glue working model *******
+
+
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark import SparkConf, SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from py4j.java_gateway import java_import
+from datetime import datetime
+from pyspark.sql import functions as F
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+from json import dumps
+from io import StringIO
+import snowflake.connector 
+from snowflake.sqlalchemy import URL
+from sqlachemy import create_engine
+import os
+import pandas as pd
+import numpy as np
+import boto3
+
+
+from botocore.config import Config
+
+my_config = Config(
+    region_name = 'us-west-2',
+    signature_version = 'v4',
+    retries = {
+        'max_attempts': 10,
+        'mode': 'standard'
+    }
+)
+sc = SparkContext("local", "Simple App")
+spark = SQLContext(sc)
+spark_conf = SparkConf().setMaster('local').setAppName('<YOUR_APP_NAME>')
+
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+## @params: [JOB_NAME, URL, ACCOUNT, WAREHOUSE, DB, SCHEMA, USERNAME, PASSWORD]
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'URL', 'ACCOUNT', 'WAREHOUSE', 'DB', 'SCHEMA','USERNAME', 'PASSWORD','CONF'])
+
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+java_import(spark._jvm, "SNOWFLAKE_SOURCE_NAME")
+
+## uj = sc._jvm.net.snowflake.spark.snowflake
+spark._jvm.net.snowflake.spark.snowflake.SnowflakeConnectorUtils.enablePushdownSession(spark._jvm.org.apache.spark.sql.SparkSession.builder().getOrCreate())
+sfOptions = {
+"sfURL" : args['URL'],
+"sfAccount" : args['ACCOUNT'],
+"sfUser" : args['USERNAME'],
+"sfPassword" : args['PASSWORD'],
+"sfDatabase" : args['DB'],
+"sfSchema" : args['SCHEMA'],
+"sfWarehouse" : args['WAREHOUSE'],
+"sfConf":args['CONF']
+
+}
+print("Success")
+create_engine=sfOptions
+engine=create_engine
+connection=engine.connect()
+read_data = "(SELECT * FROM PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP  ') as t"
+#df=spark.read.format('jdbc').options(
+         #url='pgedevdatalake.snowflakecomputing.com',
+         #dbtable=read_data ,
+         #user='olap',
+         #password='K1ngK0ng#'
+         #).load()
+#df = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", "PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP").load()
+#query= ''' SELECT DISTINCT BANK_OBJECTID FROM PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP ''';
+
+#bike= """select   BANK_OBJECTID from  PGEDWDEV.WAREHOUSE.HUB_GIS_ASSET_MAP limit 10"""
+#sql3="""select customer_name, sum(demand_amt) as total_spent from {0} GROUP BY  customer_name""".format(tbl1)
+### Query data
+def load_query():
+    return f"""select * from staging.overloaded_test limit 10"""
+
+def get_load():
+  
+    load1 = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",load_query()).load()
+    a=load1.select([F.col(x).alias(x.lower()) for x in load1.columns])
+    load=a.toPandas()
+    load['time_interval'] = 1    
+    
+    #print(load)
+    return load
+
+def fahrenheit_to_celsius(temp):
+    return (temp - 32)*5/9
+
+### Calculate top oil and winding temperatures
+def top_oil_temp(rise_at_rated_load, load_ratio, ratio_load_loss=2, n=0.8):
+    return rise_at_rated_load*((load_ratio*ratio_load_loss + 1)/(ratio_load_loss + 1))**n
+
+def winding_temp(rise_at_rated_load, load_ratio, m=0.8):
+  return (rise_at_rated_load)*(load_ratio**((2*m)))
+
+### Calculate rise over ambient temperature
+def rise_over_ambient_temp(ultimate_temp, init_temp, time_constant, time_interval):
+    return (ultimate_temp - init_temp)*(1 - np.exp(-time_interval/time_constant)) + init_temp
+
+def calculate_temp(xfmr_part, load_ratio, time_interval, time_constant, rise_at_rated_load):
+    if xfmr_part not in ['winding', 'topoil']:
+        raise ValueError('xfmr_part must be one of "winding" or "topoil"')
+    
+    if xfmr_part == 'winding':
+      ultimate_temp = winding_temp(rise_at_rated_load=rise_at_rated_load,
+                                     load_ratio=load_ratio)							 
+    else:
+        ultimate_temp = top_oil_temp(rise_at_rated_load=rise_at_rated_load,
+                                     load_ratio=load_ratio)
+    
+    temp_0 = load_ratio.iloc[0]
+    init_temp = ultimate_temp.shift(1, fill_value=temp_0)
+    
+    return rise_over_ambient_temp(ultimate_temp=ultimate_temp,
+                                  init_temp=init_temp,
+                                  time_interval=time_interval,
+                                  time_constant=time_constant)
+
+### Get winding & top oil rise over ambient
+def get_temps(load, capacity, time_interval, winding_time_constant=4/60, oil_time_constant=180/60, to_rise_at_rated_load=52.82, w_rise_at_rated_load=15.96):
+    load_ratio = (load/capacity).astype('float')
+    
+    w_temp = calculate_temp(xfmr_part='winding',
+                            load_ratio=load_ratio,
+                            time_interval=time_interval,
+                            time_constant=winding_time_constant,
+                            rise_at_rated_load=w_rise_at_rated_load)
+
+    to_temp = calculate_temp(xfmr_part='topoil',
+                             load_ratio=load_ratio,
+                             time_interval=time_interval,
+                             time_constant=oil_time_constant,
+                             rise_at_rated_load=to_rise_at_rated_load)
+							 
+    return w_temp, to_temp
+
+### Get hotspot temperature
+def hotspot_temp(ambient_temp, top_oil_temp, winding_temp):
+    return ambient_temp + top_oil_temp + winding_temp
+
+### Calculate aging metrics
+def factor_accelerated_aging(hotspot_temp):
+    return np.exp(15000/383 - 15000/(hotspot_temp + 273))
+
+def factor_equivalent_aging(faa):
+    return np.mean(faa)
+
+def loss_of_life(feqa, life_span=180000):
+    return feqa*24*100/life_span
+    
+def main():
+    
+    
+    
+    tym = datetime.now()
+
+    # Query load data for a given 
+    df = get_load()
+    
+   # print("Time Taken by Query =", datetime.now() - tym , " seconds.")
+    
+#    print("count= ",df["bank_objectid"].count())
+    
+    if df["bank_objectid"].count()>0:
+        # Grab transformer capacity from the query
+        capacity = df.ratedkva.iloc[0]
+        
+        # Calculate winding and top oil temperatures from load and capacity
+        
+        df['winding_temp'], df['top_oil_temp'] = get_temps(load=df.hourly_usage,
+                                                           capacity=capacity,
+                                                       time_interval=df.time_interval)
+	
+	    # Calculate hotspot temperature from ambient, winding, and top oil temperatures
+        df['hotspot_temp'] = hotspot_temp(ambient_temp=df.mean_temp.astype('float'),
+                                          winding_temp=df.winding_temp,
+                                          top_oil_temp=df.top_oil_temp)
+        
+        # Calculate hourly accelerated aging from the hotspot temperature
+        df['faa'] = factor_accelerated_aging(df.hotspot_temp)
+        df['faa'] = np.where(df.ratio.abs() > 1,
+                             df.faa,
+                             0)    
+        # Calculate a rolling 24 hour equivalent aging factor
+        df['feqa'] = df.groupby('usage_date_beginning')['faa'].transform('mean')  
+        
+        # Calculate % loss of life
+        df['lol'] = loss_of_life(df.feqa)
+        df.to_sql('my_table',con=engine,index=False)
+        print("table created")
+   
+        #print(df)
+        #df_sp = spark.createDataFrame(df)
+        #df
+        #print(type(df_sp)
+         ## write data to S3
+        bucketName = "dsm-datalake-s3-bucket-dev"
+        s3_prefix = "Datalake_Raw/test1"
+        dt = datetime.now()
+        datestr = dt.strftime("%Y%m%d")
+        timestr = dt.strftime("%H%M%S%f")
+        fileName = 'overloaded_xfmr_'+datestr+'_'+timestr+'.csv'
+
+        file_prefix = "/".join([s3_prefix,fileName])
+
+        csv_buffer = StringIO()
+        df.to_csv(csv_buffer)
+        ssm = boto3.client('ssm',region_name='us-west-2')
+        kmskey=ssm.get_parameter(Name='/datalake/storage/s3/kmskey', WithDecryption=True)['Parameter']['Value']
+        s3_resource = boto3.resource('s3')
+        s3_resource.Object(bucketName, file_prefix).put(Body=csv_buffer.getvalue() ,ServerSideEncryption= "aws:kms", SSEKMSKeyId =kmskey)
+        print("Done!")
+main()  
+*****************************
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark import SparkConf, SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from py4j.java_gateway import java_import
+from datetime import datetime
+from pyspark.sql import functions as F
+from pyspark.sql import Row
+from pyspark.sql.types import *
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+from json import dumps
+from io import StringIO
+import os
+import pandas as pd
+import numpy as np
+import boto3
+
+
+from botocore.config import Config
+sc = SparkContext("local", "Simple App")
+spark = SQLContext(sc)
+spark_conf = SparkConf().setMaster('local').setAppName('<YOUR_APP_NAME>')
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+## @params: [JOB_NAME, URL, ACCOUNT, WAREHOUSE, DB, SCHEMA, USERNAME, PASSWORD]
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'URL', 'ACCOUNT', 'WAREHOUSE', 'DB', 'SCHEMA','USERNAME', 'PASSWORD','CONF'])
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+java_import(spark._jvm, "SNOWFLAKE_SOURCE_NAME")
+## uj = sc._jvm.net.snowflake.spark.snowflake
+spark._jvm.net.snowflake.spark.snowflake.SnowflakeConnectorUtils.enablePushdownSession(spark._jvm.org.apache.spark.sql.SparkSession.builder().getOrCreate())
+sfOptions = {
+"sfURL" : args['URL'],
+"sfAccount" : args['ACCOUNT'],
+"sfUser" : args['USERNAME'],
+"sfPassword" : args['PASSWORD'],
+"sfDatabase" : args['DB'],
+"sfSchema" : args['SCHEMA'],
+"sfWarehouse" : args['WAREHOUSE'],
+"sfConf":args['CONF']
+
+}
+print("Success")
+read_data = "select * from staging.overloaded_test limit 10"
+a = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",read_data).load()
+b=a.select([F.col(x).alias(x.lower()) for x in a.columns])
+df=b.toPandas()
+df['time_interval'] = 1
+def fahrenheit_to_celsius(temp):
+    return (temp - 32)*5/9
+
+### Calculate top oil and winding temperatures
+def top_oil_temp(rise_at_rated_load, load_ratio, ratio_load_loss=2, n=0.8):
+    return rise_at_rated_load*((load_ratio*ratio_load_loss + 1)/(ratio_load_loss + 1))**n
+
+def winding_temp(rise_at_rated_load, load_ratio, m=0.8):
+  return (rise_at_rated_load)*(load_ratio**((2*m)))
+
+### Calculate rise over ambient temperature
+def rise_over_ambient_temp(ultimate_temp, init_temp, time_constant, time_interval):
+    return (ultimate_temp - init_temp)*(1 - np.exp(-time_interval/time_constant)) + init_temp
+
+def calculate_temp(xfmr_part, load_ratio, time_interval, time_constant, rise_at_rated_load):
+    if xfmr_part not in ['winding', 'topoil']:
+        raise ValueError('xfmr_part must be one of "winding" or "topoil"')
+    
+    if xfmr_part == 'winding':
+      ultimate_temp = winding_temp(rise_at_rated_load=rise_at_rated_load,
+                                     load_ratio=load_ratio)							 
+    else:
+        ultimate_temp = top_oil_temp(rise_at_rated_load=rise_at_rated_load,
+                                     load_ratio=load_ratio)
+    
+    temp_0 = load_ratio.iloc[0]
+    init_temp = ultimate_temp.shift(1, fill_value=temp_0)
+    
+    return rise_over_ambient_temp(ultimate_temp=ultimate_temp,
+                                  init_temp=init_temp,
+                                  time_interval=time_interval,
+                                  time_constant=time_constant)
+
+### Get winding & top oil rise over ambient
+def get_temps(load, capacity, time_interval, winding_time_constant=4/60, oil_time_constant=180/60, to_rise_at_rated_load=52.82, w_rise_at_rated_load=15.96):
+    load_ratio = (load/capacity).astype('float')
+    
+    w_temp = calculate_temp(xfmr_part='winding',
+                            load_ratio=load_ratio,
+                            time_interval=time_interval,
+                            time_constant=winding_time_constant,
+                            rise_at_rated_load=w_rise_at_rated_load)
+
+    to_temp = calculate_temp(xfmr_part='topoil',
+                             load_ratio=load_ratio,
+                             time_interval=time_interval,
+                             time_constant=oil_time_constant,
+                             rise_at_rated_load=to_rise_at_rated_load)
+							 
+    return w_temp, to_temp
+
+### Get hotspot temperature
+def hotspot_temp(ambient_temp, top_oil_temp, winding_temp):
+    return ambient_temp + top_oil_temp + winding_temp
+
+### Calculate aging metrics
+def factor_accelerated_aging(hotspot_temp):
+    return np.exp(15000/383 - 15000/(hotspot_temp + 273))
+
+def factor_equivalent_aging(faa):
+    return np.mean(faa)
+
+def loss_of_life(feqa, life_span=180000):
+    return feqa*24*100/life_span
+    
+capacity = df.ratedkva.iloc[0]
+        
+        # Calculate winding and top oil temperatures from load and capacity
+        
+df['winding_temp'], df['top_oil_temp'] = get_temps(load=df.hourly_usage,
+                                                           capacity=capacity,
+                                                       time_interval=df.time_interval)
+	
+	    # Calculate hotspot temperature from ambient, winding, and top oil temperatures
+df['hotspot_temp'] = hotspot_temp(ambient_temp=df.mean_temp.astype('float'),
+                                          winding_temp=df.winding_temp,
+                                          top_oil_temp=df.top_oil_temp)
+        
+        # Calculate hourly accelerated aging from the hotspot temperature
+df['faa'] = factor_accelerated_aging(df.hotspot_temp)
+df['faa'] = np.where(df.ratio.abs() > 1,
+                             df.faa,
+                             0)    
+        # Calculate a rolling 24 hour equivalent aging factor
+df['feqa'] = df.groupby('usage_date_beginning')['faa'].transform('mean')  
+        
+        # Calculate % loss of life
+df['lol'] = loss_of_life(df.feqa)
+        
+df1 = spark.createDataFrame(df)
+df1.write.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", "rajatest").mode('overwrite')
+print("done")
+#spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",read_data).load()
+**************************rekha job*****
+
+
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from py4j.java_gateway import java_import
+
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+
+## @params: [JOB_NAME, URL, ACCOUNT, WAREHOUSE, DB, SCHEMA, USERNAME, PASSWORD]
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'URL', 'ACCOUNT', 'WAREHOUSE', 'DB', 'SCHEMA', 'USERNAME', 'PASSWORD'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+java_import(spark._jvm, SNOWFLAKE_SOURCE_NAME)
+
+
+
+## uj = sc._jvm.net.snowflake.spark.snowflake, enable query pushdown to Snowflake
+spark._jvm.net.snowflake.spark.snowflake.SnowflakeConnectorUtils.enablePushdownSession(spark._jvm.org.apache.spark.sql.SparkSession.builder().getOrCreate())
+sfOptions = {
+"sfURL" : args['URL'],
+"sfAccount" : args['ACCOUNT'],
+"sfUser" : args['USERNAME'],
+"sfPassword" : args['PASSWORD'],
+"sfDatabase" : args['DB'],
+"sfSchema" : args['SCHEMA'],
+"sfWarehouse" : args['WAREHOUSE'],
+}
+
+print("Test")
+
+
+## Read from a Snowflake table into a Spark Data Frame
+df = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", "PGEDWDEV.WAREHOUSE.HUB_HR_EMPLOYEE").load()
+df.show()
+
+
+## Perform any kind of transformations on your data and save as a new Data Frame: "df1"
+## df1 = df.[Insert any filter, transformation, or other operation]
+## Write the Data Frame contents back to Snowflake in a new table 
+## df1.write.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", "[new_table_name]").mode("overwrite").save() 
+job.commit()
+
+----------------------
+working code
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark import SparkConf, SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from py4j.java_gateway import java_import
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
+from datetime import datetime
+from pyspark.sql import functions as F
+from pyspark.sql import Row
+from pyspark.sql.types import *
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from json import dumps
+from io import StringIO
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from dateutil import tz
+import boto3
+from pyspark.sql.functions import from_utc_timestamp
+
+#sc = SparkContext("local", "Simple App")
+#conf = SparkConf.set("spark.executor.memory", "16g")
+#sc =  SparkContext(conf)
+
+spark_con = (
+    SparkConf()
+    .setAppName("Your App Name")
+    .set('spark.executor.memory', '10g')
+    .set('spark.driver.memory', '19g')
+    .set('spark.yarn.executor.memoryOverhead','5g')
+    .set('spark.driver.maxResultSize','0')
+    .set("spark.memory.fraction", '0.8')
+    .set("spark.sql.shuffle.partitions" , '100')
+   #.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+    #.set("spark.sql.execution.arrow.enabled", "true")
+    .set('spark.sql.autoBroadcastJoinThreshold', '-1')
+    .set('spark.sql.session.timeZone', 'UTC'))
+#conf = SparkConf.setAll([('spark.executor.memory', '23g'), ('spark.driver.memory','9g')])
+#sc = SparkContext(conf)
+#conf = spark.sparkContext._conf.setAll([('spark.executor.memory', '23g'), ('spark.driver.memory','9g')])
+#sc =  SparkContext(conf)
+#spark = SQLContext(sc)
+sc = SparkContext(conf = spark_con)
+#sc = SparkContext(conf = spark_con, serializer=ArrowSerializer())
+spark = SQLContext(sc)
+spark_conf = SparkConf().setMaster('local').setAppName('<YOUR_APP_NAME>')
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+## @params: [JOB_NAME, URL, ACCOUNT, WAREHOUSE, DB, SCHEMA, USERNAME, PASSWORD]
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'URL', 'ACCOUNT', 'WAREHOUSE', 'DB', 'SCHEMA','USERNAME', 'PASSWORD'])
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+java_import(spark._jvm, "SNOWFLAKE_SOURCE_NAME")
+## uj = sc._jvm.net.snowflake.spark.snowflake
+spark._jvm.net.snowflake.spark.snowflake.SnowflakeConnectorUtils.enablePushdownSession(spark._jvm.org.apache.spark.sql.SparkSession.builder().getOrCreate())
+sfOptions = {
+"sfURL" : args['URL'],
+"sfAccount" : args['ACCOUNT'],
+"sfUser" : args['USERNAME'],
+"sfPassword" : args['PASSWORD'],
+"sfDatabase" : args['DB'],
+"sfSchema" : args['SCHEMA'],
+"sfWarehouse" : args['WAREHOUSE'],
+#"sfConf":args['CONF']
+}
+#conn= snowflake.connector.connect(user=con_target['user'],password=con_target['password'],account=con_target['account'],database='PGEDWDEV')
+print("Success")
+# Define constants
+winding_time_constant = 4/60
+oil_time_constant = 180/60
+to_rise_at_rated_load = 52.82
+w_rise_at_rated_load = 15.96
+ratio_load_loss = 2
+n = 0.8
+m = 0.8
+time_interval = 1
+life_span=180000
+
+# Read Data
+sql = "select * from staging.overloaded_test"
+df = spark.read.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("query",sql).load()
+
+# Clean column names
+df = df.select([F.col(x).alias(x.lower()) for x in df.columns])
+#df.show(2,False)
+#df.show()
+# Create initial columns
+df = df.withColumn('dte', F.date_trunc('day', df['dttm']))
+df=df.withColumn('mean_temp', (df['mean_temp'] -32)*5/9)
+df=df.withColumn('w_ult_temp', (to_rise_at_rated_load)*(df['ratio']**((2*m))))
+df=df.withColumn('to_ult_temp', (to_rise_at_rated_load)*((df['ratio']*ratio_load_loss + 1)/(ratio_load_loss + 1))**n)
+#df.show(2,False)
+# Create lag window
+#lw = Window.partitionBy([F.col('bank_objectid')).orderBy(F.col('dttm')])
+#lw = Window.partitionBy([F.col('bank_objectid')).orderBy(F.col('dttm')])
+lw=Window.partitionBy("bank_objectid").orderBy("dttm")
+# Create lag columns
+df=df.withColumn('w_init_temp', F.lag(df['w_ult_temp']).over(lw)) 
+df=df.withColumn('to_init_temp', F.lag(df['to_ult_temp']).over(lw)) 
+df=df.withColumn('w_rise_temp', (df['w_ult_temp'] - df['w_init_temp'])*(1 -np.exp(-time_interval/winding_time_constant)) + df['w_init_temp']) 
+df=df.withColumn('to_rise_temp', (df['to_ult_temp'] - df['to_init_temp'])*(1 - np.exp(-time_interval/oil_time_constant)) + df['to_init_temp'])
+df=df.withColumn('hotspot_temp', df['mean_temp'] + df['w_rise_temp'] + df['to_rise_temp'])
+df=df.withColumn('accelerated_aging', F.exp(15000/383 - 15000/(df['hotspot_temp'] + 273)))
+# Create partition window for factor of equivalent aging
+fw = Window.partitionBy([F.col('bank_objectid'), F.col('dte')])
+
+# Create factor of equivalent aging
+df =df.withColumn('feqa', F.mean(df['accelerated_aging']).over(fw)) 
+df=df.withColumn('loss_of_life', df['feqa']*24*100/life_span)
+
+#df.show(2,False)
+df.write.format(SNOWFLAKE_SOURCE_NAME).options(**sfOptions).option("dbtable", "rajatest11").mode('overwrite').save()
+print("done")
+--------------------------
+
+NOAAA -COMPLETED---------------
+
+import json
+import time
+import pytz
+from pytz import timezone
+import requests
+import datetime
+from datetime import timedelta
+from dateutil.tz import tzutc, UTC
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pandas as pd
+from pandas import DataFrame
+import numpy as np
+from io import BytesIO
+from json import dumps
+from datetime import datetime as dt
+
+import boto3
+s3 = boto3.client('s3')
+s3 = boto3.resource("s3")
+ssm = boto3.client('ssm', region_name='us-west-2')
+kmskey = ssm.get_parameter(Name='/datalake/storage/s3/kmskey', WithDecryption=True)['Parameter']['Value']
+noaa_codes = [
+    'KAST',
+    'KBDN',
+    'KCVO',
+    'KEUG',
+    'KHIO',
+    'KHRI',
+    'KMMV',
+    'KONP',
+    'KPDX',
+    'KRDM',
+    'KSLE',
+    'KSPB',
+    'KTMK',
+    'KTTD',
+    'KUAO'
+]
+urls = [f"https://api.weather.gov/stations/{x}/observations/latest" for x in noaa_codes]
+file = [line.strip() for line in urls]
+ssm = boto3.client('ssm',region_name='us-west-2')
+accountid=ssm.get_parameter(Name='/datalake/bi_accountid', WithDecryption=True)['Parameter']['Value']
+
+print("accountid ", accountid)
+
+if accountid == "475210740017":
+    print("Dev Environment")
+    s3_bucket1= "dsm-datalake-s3-bucket-dev"
+    s3_bucket = "dsm-datascience-dev"
+    s3_bucket3= "test-par"
+elif accountid == "679494167814":
+    print("Test Environment")
+    s3_bucket1= "dsm-datalake-s3-bucket-test"
+    s3_bucket = "dsm-datascience-test"
+    s3_bucket3= "test-par"
+elif accountid == "554931768202":
+    print("Prod Environment")
+    s3_bucket1= "dsm-datalake-s3-bucket-prod"
+    s3_bucket = "dsm-datascience-prod"
+    #s3_bucket3= "test-par"
+
+s3_prefix1 = "Datalake_Raw/Weather/Noaa/measurement/PARQ_FILES"
+s3_prefix = "Datalake_Raw/Weather/Noaa/measurement"
+#s3_prefix2 = "Datalake_Raw/Weather/Noaa/measurement/LATEST_24HRS"
+filepath = "Datalake_Raw/Weather/Noaa/measurement/Latest_48Hours"
+remove_filepath="Datalake_Raw/Weather/Noaa/measurement/Latest_48Hours/noaa"
+#bucketName = 'dsm-datalake-s3-bucket-dev'
+timeRange  = 48
+
+def get_datetime():
+    dt = datetime.datetime.now()
+    return dt.strftime("%Y%m%d"), dt.strftime("%H:%M:%S")
+    
+def remove_files(s3_bucket1,remove_filepath,timeRange):
+  s3 = boto3.resource('s3')
+  bucket = s3.Bucket(s3_bucket1)
+  files=[]
+  for object in bucket.objects.filter(Prefix=remove_filepath):
+    if (object.last_modified <= datetime.datetime.now(tzutc()) - timedelta(hours = timeRange)) :   
+      files.append(object.key)
+      response = bucket.delete_objects(Delete={'Objects': [{'Key': object.key }]})
+  return files
+  
+def reshape(r):
+    cor=r["geometry"]
+    props = r["properties"]
+    res = {
+        "X_COORDINATES":cor["coordinates"][0],
+        "Y_COORDINATES":cor["coordinates"][1],
+        "STATION": props["station"].split("/")[-1],
+        "txd":props["textDescription"],
+        "CELSIUS_TEMP": props["temperature"]["value"],
+        "DEWPOINT": props["dewpoint"]["value"],
+        "SEALEVELPRESSURE": props["seaLevelPressure"]["value"],
+        "BAROMETRICPRESSURE": props["barometricPressure"]["value"],
+        "PRCPLH":props["precipitationLastHour"]["value"],
+        "VISIBILITY": props["visibility"]["value"],
+        "WINDSPEED": props["windSpeed"]["value"],
+        "WINDGUST": props["windGust"]["value"],
+        "HUMIDITY": props["relativeHumidity"]["value"],
+        "WINDDIRECTION": props["windDirection"]["value"]
+    }
+    return res
+
+    
+def lambda_handler(event, context):
+    """
+    """
+    outputStatus = 0 ## Success=1 , Failed=0
+    errorMessage = ''
+    responses = []
+    try:
+        for url in file:
+            r = requests.get(url)
+            while r.status_code == 404:
+                print("The URL is not hit")
+                time.sleep(300)
+            if r.status_code != 404:
+                print("the URl is HIT ")
+            responses.append(reshape(r.json()))
+            
+        s3_prefix1 = "Datalake_Raw/Weather/Noaa/measurement/PARQ_FILES"
+        s3_prefix = "Datalake_Raw/Weather/Noaa/measurement"
+        datestr,timestr = get_datetime()
+        fname = f"noaa_hourly_measurements_latest"
+        file_prefix = "/".join([s3_prefix,fname])
+        fname1 = f"noaa_hourly_measurements.PARQUET_FILE_{datestr}_{timestr}"
+        fname2 = f"noaa_hourly_measurements.JSON_FILE"
+        file_prefix1 = "/".join([s3_prefix1,fname1])
+        file_prefix3 = "/".join([filepath,fname1])
+        file_prefix2 = "/".join([s3_prefix,fname2])
+        s3_obj = s3.Object(s3_bucket, file_prefix)
+        serialized = []
+        for r in responses:
+            serialized.append(json.dumps(r))
+        jsonlines_doc = "\n".join(serialized)
+        #s3_obj.put(Body=json.dumps(jsonlines_doc))
+        df = pd.read_json(jsonlines_doc, lines=True)
+        df['FER_TEMP']= ((df['CELSIUS_TEMP'] * 9/5) + 32).round(2)
+        df['DEWPOINT_FER']=((df['DEWPOINT'] * 9/5) +32).round(2)
+        df['SEALEVELPRESSURE']=df['SEALEVELPRESSURE'].div(1000).round(2)
+        df['PRCPLH']=df['PRCPLH'].fillna(0)
+        #df['PRCPLH']=df['PRCPLH'].astype(int)
+        df.insert(0, 'timestamp', pd.datetime.now().replace(microsecond=0))
+        date = pd.datetime.now(tz=pytz.utc)
+        date1 = date.astimezone(timezone('US/Pacific'))
+        dateformat=date1.strftime("%Y-%m-%d %H:%M:%S")
+        df.insert(0, 'TIMESTAMP_MEASUREMENT_PST',dateformat)
+        #df['CURRENT_PRCP'] = df['PRCPLH']
+        df['CURRENT_SNDP'] = df['txd'].str.contains('Snow').astype(int)
+        df['CURRENT_FOG'] = df['txd'].str.contains('Fog').astype(int)
+        df['CURRENT_RAIN_DRIZZLE'] = df['txd'].str.contains('Rain_Drizzle').astype(int)
+        df['CURRENT_SNOW_ICE_PELLLETS'] = df['txd'].str.contains('Ice').astype(int)
+        df['CURRENT_HAIL'] = df['txd'].str.contains('Hail').astype(int)
+        df['CURRENT_THUNDER'] = df['txd'].str.contains('Thunder').astype(int)
+        df['CURRENT_TORANDO_FUNNEL_CLOUD'] = df['txd'].str.contains('Torando').astype(int)
+        df.insert(0, 'TIMESTAMP_MEASUREMENT_DEFAULT', datetime.datetime.now().replace(microsecond=0))
+        df.drop('timestamp',axis='columns', inplace=True)
+        for col in df.columns:
+            print(col)
+        print(df)
+        print(df['txd'])
+        print(df['PRCPLH'])
+        print(df['FER_TEMP'])
+        print(df['SEALEVELPRESSURE'])
+        
+        out_buffer = BytesIO()
+        df.to_parquet(out_buffer)
+        s3_resource = boto3.resource('s3')
+        #s3_resource.Object(s3_bucket3, file_prefix1).put(Body=out_buffer.getvalue())
+        s3_resource.Object(s3_bucket1, file_prefix1).put(Body=out_buffer.getvalue())
+        s3_resource.Object(s3_bucket1, file_prefix3).put(Body=out_buffer.getvalue())
+        print("parquet file Written ")
+        #json_buffer = BytesIO()
+        df1=df.to_json(orient='records')
+        s3_obj = s3.Object(s3_bucket, file_prefix)
+        s3_obj.put(Body=json.dumps(df1))
+        print("json file written ")
+        files = remove_files(s3_bucket1,remove_filepath,timeRange)
+        print("**********Task Completed******")
+        outputStatus = 1 ## Success=1 , Failed=0
+        errorMessage = 'No Error'
+    except :
+        outputStatus = 0 ## Success=1 , Failed=0
+        errorMessage = "Error"        
+    return {
+        'Status'        :   outputStatus,
+        'errorMessage'   :  errorMessage
+        }
+    
+
+    #ExtraArgs={"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": kmskey})
+    #s3_resource.object(filename, bucketname, objectkey, ExtraArgs={"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": })
+    #s3_resource.upload_file(filename, bucketname, objectkey, ExtraArgs={"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": })import json
+	
+	--------------------------------------
+	
+import re
+import pandas as pd
+import numpy as np
+from census import Census
+import census_tables_dict as d
+import json
+import datetime
+from io import BytesIO
+from datetime import timedelta
+#from datetime import datetime as dt
+import boto3
+s3_resource = boto3.resource('s3')
+
+def get_datetime():
+    dt = datetime.datetime.now()
+    #dt = datetime.now()
+    return dt.strftime("%Y%m%d"), dt.strftime("%H:%M:%S")
+    
+
+# Whether to return wide data (~830 rows, 340 columns) or long (~280k rows, 6 columns)
+long = False
+
+# FIXME: insert AWS account Census API key
+# https://api.census.gov/data/key_signup.html
+c = Census('29cb02926405d359ad2d480254dca1e2d11dfcb8')
+
+
+def get_census_data(census_obj, long=long):
+    # Define lists
+    census_id = list()
+    census_vars = list()
+    human_readable = list()
+
+    # Create mapping between Census tables and human-readable column names
+    for i in d.tables.keys():
+        cen_name = d.tables[i]['census_id']
+        census_id.append(cen_name)
+
+        census_vars = census_vars + \
+                        [cen_name + '_' + variable + 'E' for variable in d.tables[i]['variables']] + \
+                        [cen_name + '_' + variable + 'M' for variable in d.tables[i]['variables']]
+        human_readable = human_readable + \
+                        [name + 'E' for name in d.tables[i]['var_names']] + \
+                        [name + 'M' for name in d.tables[i]['var_names']]
+
+    # Request from Census API
+    census_tup = tuple(['NAME'] + census_vars)
+    census_df = pd.DataFrame(census_obj.acs5.state_county_tract(census_tup, '41', Census.ALL, Census.ALL))
+	
+	# Ensure column order
+    census_df = census_df[['NAME', 'state', 'county', 'tract'] + census_vars]
+
+    # Rename columns with human-readable names
+    census_df.columns = ['name', 'state', 'county', 'tract'] + human_readable
+    
+    # Ensure ID columns are strings
+    for i in ['state', 'county', 'tract']:
+        census_df[i] = census_df[i].astype(int).astype(str)
+
+    # Reformat to long structure, if desired
+    if long:
+        census_df = pd.melt(census_df,
+                            id_vars=['name', 'state', 'county', 'tract'])
+
+    # Create GEOID column to link to the service point mapping table
+    census_df['GEOID'] = census_df.state + \
+                            census_df.county.str.pad(width=3,
+                                                              fillchar='0') + \
+                            census_df.tract.str.pad(width=6,
+                                                             fillchar='0')
+    census_df['year'] = datetime.datetime.now().year - 2                
+	
+    #print(census_df)
+    return census_df
+
+def transform_census_data(census):
+    
+    # Industry columns
+    industry_cols = [i for i in census.columns if ('industry_' in i) and ('E' in i)]
+    
+    census['industry_total'] = census[industry_cols].sum(axis=1)
+    
+    for i in industry_cols:
+        census['perc_' + i] = census[i]/census['industry_total']
+    
+    # Computing devices columns
+    census['perc_hh_has_computing_devices'] = census.hh_has_computing_devicesE/(census.hh_has_computing_devicesE + census.hh_has_no_computerE)
+    census['perc_hh_has_no_computing_devices'] = census.hh_has_no_computerE/(census.hh_has_computing_devicesE + census.hh_has_no_computerE)
+    
+    # Education columns
+    educ_cols = [i for i in census.columns if ('educ_' in i) and ('E' in i)]
+    census['educ_total'] = census[educ_cols].sum(axis=1)
+    for i in educ_cols:
+        census['perc_' + i] = census[i]/census['educ_total']
+    
+    # Labor force columns
+    census['perc_pop_not_in_labor_force'] = census.pop_not_in_labor_forceE/census.pop_work_ageE
+    census['perc_pop_in_civ_labor_force_unemp'] = census.pop_in_civ_labor_force_unempE/census.pop_in_civ_labor_forceE
+    
+    # Household type columns
+    census['perc_hh_type_family_married'] = census.hh_type_family_marriedE/census.hh_typeE
+    census['perc_hh_type_single_parent'] = (census.hh_type_family_other_single_dadE + census.hh_type_family_other_single_momE)/census.hh_typeE
+    census['perc_hh_type_nonfamily_roommates'] = census.hh_type_nonfamily_roommatesE/census.hh_typeE
+    census['perc_hh_type_nonfamily_bach'] = census.hh_type_nonfamily_bachE/census.hh_typeE
+    
+    # Rent cost columns
+    rent_cols = ['hh_rent_10_perc_income',
+                 'hh_rent_10to15_perc_income',
+                 'hh_rent_15to20_perc_income',
+                 'hh_rent_20to25_perc_income',
+                 'hh_rent_25to30_perc_income',
+                 'hh_rent_30to35_perc_income',
+                 'hh_rent_35to40_perc_income',
+                 'hh_rent_40to45_perc_income',
+                 'hh_rent_45to50_perc_income',
+                 'hh_rent_over50_perc_income']
+
+    for i in rent_cols:
+        census['perc_' + i] = census[i + 'E']/census.hh_rentE
+        
+    # Health insurance columns
+    census['perc_health_ins_private'] = (census.num_per_native_health_ins_privateE + census.num_per_foreign_natur_health_ins_privateE + census.num_per_foreign_noncit_health_ins_privateE)/census.num_perE
+    census['perc_health_ins_private'] = (census.num_per_native_health_ins_publicE + census.num_per_foreign_natur_health_ins_publicE + census.num_per_foreign_noncit_health_ins_publicE)/census.num_perE
+    census['perc_health_ins_private'] = (census.num_per_native_no_health_insE + census.num_per_foreign_natur_no_health_insE + census.num_per_foreign_noncit_no_health_insE)/census.num_perE
+    census['perc_native'] = census.num_per_nativeE/census.num_perE
+    census['perc_foreign_natur'] = census.num_per_foreign_naturE/census.num_perE
+    census['perc_foreign_noncit'] = census.num_per_foreign_noncitE/census.num_perE
+    
+    # Work transportation columns
+    census['perc_work_transp_car'] = census.work_transp_carE/census.work_transpE
+    census['perc_work_transp_public'] = census.work_transp_publicE/census.work_transpE
+    
+    # Number of household workers columns
+    worker_cols = [i for i in census.columns if ('hh_workers_' in i) and ('E' in i)]
+    census['hh_workers_total'] = census[worker_cols].sum(axis=1)
+    for i in worker_cols:
+        census['perc_' + i] = census[i]/census['hh_workers_total']
+    
+    # Occupation columns
+    occup_cols = [i for i in census.columns if ('occup_' in i) and ('E' in i)]
+    for i in occup_cols:
+        census['perc' + i] = census[i]/census.occupE
+    
+    # Poverty level
+    census['perc_poverty_lev_below'] = census.poverty_lev_belowE/census.poverty_levE
+    
+    # Received welfare
+    census['perc_hh_welfare_received'] = census.hh_welfare_receivedE/census.hh_welfareE
+    
+    # Internet columns
+    census['hh_internet_subscrip'] = census.hh_internet_subscripE/census.hh_internetE
+    census['hh_internet_no_subscrip'] = census.hh_internet_no_subscripE/census.hh_internetE
+    census['hh_internet_no_access'] = census.hh_internet_no_accessE/census.hh_internetE
+    
+    # Race columns
+    race_cols = [i for i in census.columns if ('hh_race_' in i) and ('E' in i)]
+    for i in race_cols:
+        census['perc' + i] = census[i]/census.hh_raceE
+    
+    # Ratio of income to poverty level columns
+    inc_to_pov_cols = [i for i in census.columns if ('hh_inc_to_pov_' in i) and ('E' in i)]
+    census['hh_inc_to_pov_lev_total'] = census[inc_to_pov_cols].sum(axis=1)
+    for i in inc_to_pov_cols:
+        census['perc_' + i] = census[i]/census['hh_inc_to_pov_lev_total']
+    
+    # Adjust columns
+    cen_cols = [i for i in census.columns if (('perc_' in i) and not ('_perc_' in i)) or (('E' in i) and (('median' in i) or ('gini_' in i) or ('avg' in i)))]
+    all_cols = ['name', 'state', 'county', 'tract', 'GEOID', 'year']
+    all_cols.extend(cen_cols)
+    
+    census = census[all_cols]
+    
+    census.columns = [re.sub('E$', '', i) for i in census.columns]
+    
+    
+    return census
+
+s3_bucket="dsm-datalake-s3-bucket-test"
+s3_prefix = "Datalake_Raw/Census/Census_acs_5yr"
+s3_prefix1 = "Datalake_Raw/Census/Census_acs_features"
+datestr,timestr = get_datetime()
+fname = f"CENSUS_ACS_5YR_{datestr}_{timestr}"
+fname1 = f"CENSUS_ACS_FEATURES_{datestr}_{timestr}"
+file_prefix = "/".join([s3_prefix,fname])
+file_prefix1 = "/".join([s3_prefix1,fname1])
+
+
+
+
+def lambda_handler(event, context):
+    df=get_census_data(c)
+    df1=transform_census_data(df)
+    out_buffer = BytesIO()
+    out_buffer1 = BytesIO()
+    df.to_parquet(out_buffer)
+    df1.to_parquet(out_buffer1)
+    s3_resource.Object(s3_bucket, file_prefix).put(Body=out_buffer.getvalue())
+    s3_resource.Object(s3_bucket, file_prefix1).put(Body=out_buffer1.getvalue())
+    
+    print("parquet files Written ")
+    
+    
+    # TODO implement
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Success!')
+    }
+----------------------
+
+ERRORNOTIFICATIONARN = '/datalake/sns/error_noaa_test'
+SUCCESSSNSARNGRIDACCOUNT='/datalake/extract_noaa/success_test'
+COMPONENT_NAME = 'Datalake_LAMBDA_NOAA_EXTRACT'
+ERROR_MSG = 'URL IS NOT HIT*** PLEASE RERUN AFTER SOMETIME***'
+SUCCESS_MSG = 'SUCCESSFULLY EXTRACTED NOAA FILES FOR 14 STATIONS'
+SUCCESS_DESCRIPTION='SUCCESS'
+ERROR_TYPE='API ERROR'
+SOURCE_URL='/datalake/extract_noaa/api'
+
+
+#ERRORNOTIFICATIONARN = '/datalake/sns/errornotificationarn'
+#SUCCESSSNSARNGRIDACCOUNT='/adms/extract_avl/success_sns_arn_grid_account'
+#COMPONENT_NAME = 'Datalake-Extract-NOAA Lambda'
+#ERROR_MSG = 'URL IS NOT HIT***PLEASE RERUN AFTER SOMETIME****'
+-------------------------------------------------------------------
+
+import re
+import pandas as pd
+import numpy as np
+from census import Census
+import census_tables_dict as d
+import constants as constant
+import json
+import datetime
+from io import BytesIO
+from datetime import timedelta
+# from datetime import datetime as dt
+import boto3
+
+s3_resource = boto3.resource('s3')
+
+
+def get_datetime():
+    dt = datetime.datetime.now()
+    # dt = datetime.now()
+    return dt.strftime("%Y%m%d"), dt.strftime("%H:%M:%S")
+
+
+# Whether to return wide data (~830 rows, 340 columns) or long (~280k rows, 6 columns)
+long = False
+
+# FIXME: insert AWS account Census API key
+# https://api.census.gov/data/key_signup.html
+c = Census('a4642d28de30944a2e2c6c60bdc2f62559bcb14e')
+
+###function for Error  SNS Notification#####
+def send_error_sns(error_description, error_type, error_grouping_type, error_message):
+    ssm = boto3.client("ssm", region_name="us-west-2")
+    sns = boto3.client("sns", region_name="us-west-2")
+    error_sns_arn = ssm.get_parameter(Name=constant.ERRORNOTIFICATIONARN)["Parameter"]["Value"]
+    env = ssm.get_parameter(Name=constant.ENVIRONMENT, WithDecryption=True)['Parameter']['Value']
+    component_name = constant.COMPONENT_NAME
+    sns_message = (f"{component_name} : {error_description} : {error_type} : {error_grouping_type} : {error_message}")
+    err_response = sns.publish(
+        TargetArn=error_sns_arn,
+        Message=json.dumps({'default': json.dumps(sns_message)}),
+        Subject=env + " : " + component_name,
+        MessageStructure="json",
+        MessageAttributes={
+            "job_name": {"DataType": "String.Array",
+                         "StringValue": 'Datalake-Extract-NOAA'}})
+    return err_response
+
+###function for Success notification####
+def send_sns_success():
+    sns = boto3.client("sns", region_name="us-west-2")
+    ssm = boto3.client("ssm", region_name="us-west-2")
+    success_sns_arn = ssm.get_parameter(Name=constant.SUCCESSNOTIFICATIONARN, WithDecryption=True)["Parameter"]["Value"]
+    component_name = constant.COMPONENT_NAME
+    env = ssm.get_parameter(Name=constant.ENVIRONMENT, WithDecryption=True)['Parameter']['Value']
+    success_msg = constant.SUCCESS_MSG
+    sns_message = (f"{component_name} :  {success_msg}")
+    print(sns_message, 'text')
+    succ_response = sns.publish(
+        TargetArn=success_sns_arn,
+        Message=json.dumps({'default': json.dumps(sns_message)}),
+        Subject=env + " : " + component_name,
+        MessageStructure="json",
+        MessageAttributes={
+            "job_name": {
+                "DataType": "String.Array",
+                "StringValue": '["DATALAKE-Extract-CENSUS"]'}})
+    
+
+    return succ_response
+
+#Function for getting  the census data from census api via generated key ###
+def get_census_data(census_obj, long=long):
+    # Define lists
+    census_id = list()
+    census_vars = list()
+    human_readable = list()
+
+    # Create mapping between Census tables and human-readable column names
+    for i in d.tables.keys():
+        cen_name = d.tables[i]['census_id']
+        census_id.append(cen_name)
+
+        census_vars = census_vars + \
+                      [cen_name + '_' + variable + 'E' for variable in d.tables[i]['variables']] + \
+                      [cen_name + '_' + variable + 'M' for variable in d.tables[i]['variables']]
+        human_readable = human_readable + \
+                         [name + 'E' for name in d.tables[i]['var_names']] + \
+                         [name + 'M' for name in d.tables[i]['var_names']]
+
+    # Request from Census API
+    census_tup = tuple(['NAME'] + census_vars)
+    census_df = pd.DataFrame(census_obj.acs5.state_county_tract(census_tup, '41', Census.ALL, Census.ALL))
+    # print("key activated")
+
+    # except APIKeyError:
+    # send_error_sns()
+
+    # Ensure column order
+    census_df = census_df[['NAME', 'state', 'county', 'tract'] + census_vars]
+
+    # Rename columns with human-readable names
+    census_df.columns = ['name', 'state', 'county', 'tract'] + human_readable
+
+    # Ensure ID columns are strings
+    for i in ['state', 'county', 'tract']:
+        census_df[i] = census_df[i].astype(int).astype(str)
+
+    # Reformat to long structure, if desired
+    if long:
+        census_df = pd.melt(census_df,
+                            id_vars=['name', 'state', 'county', 'tract'])
+
+    # Create GEOID column to link to the service point mapping table
+    census_df['GEOID'] = census_df.state + \
+                         census_df.county.str.pad(width=3,
+                                                  fillchar='0') + \
+                         census_df.tract.str.pad(width=6,
+                                                 fillchar='0')
+    census_df['year'] = datetime.datetime.now().year - 2
+
+    # print(census_df)
+    return census_df
+
+##function for generating new cols####
+def transform_census_data(census):
+    try:
+
+        # Industry columns
+        industry_cols = [i for i in census.columns if ('industry_' in i) and ('E' in i)]
+        print(industry_cols, 'gotham')
+
+        census['industry_total'] = census[industry_cols].sum(axis=1)
+
+        for i in industry_cols:
+            census['perc_' + i] = census[i] / census['industry_total']
+
+        # Computing devices columns
+        census['perc_hh_has_computing_devices'] = census.hh_has_computing_devicesE / (
+                census.hh_has_computing_devicesE + census.hh_has_no_computerE)
+        census['perc_hh_has_no_computing_devices'] = census.hh_has_no_computerE / (
+                census.hh_has_computing_devicesE + census.hh_has_no_computerE)
+
+        # Education columns
+        educ_cols = [i for i in census.columns if ('educ_' in i) and ('E' in i)]
+        census['educ_total'] = census[educ_cols].sum(axis=1)
+        for i in educ_cols:
+            census['perc_' + i] = census[i] / census['educ_total']
+
+        # Labor force columns
+        census['perc_pop_not_in_labor_force'] = census.pop_not_in_labor_forceE / census.pop_work_ageE
+        census[
+            'perc_pop_in_civ_labor_force_unemp'] = census.pop_in_civ_labor_force_unempE / census.pop_in_civ_labor_forceE
+
+        # Household type columns
+        census['perc_hh_type_family_married'] = census.hh_type_family_marriedE / census.hh_typeE
+        census['perc_hh_type_single_parent'] = (
+                                                       census.hh_type_family_other_single_dadE + census.hh_type_family_other_single_momE) / census.hh_typeE
+        census['perc_hh_type_nonfamily_roommates'] = census.hh_type_nonfamily_roommatesE / census.hh_typeE
+        census['perc_hh_type_nonfamily_bach'] = census.hh_type_nonfamily_bachE / census.hh_typeE
+
+        # Rent cost columns
+        rent_cols = ['hh_rent_10_perc_income',
+                     'hh_rent_10to15_perc_income',
+                     'hh_rent_15to20_perc_income',
+                     'hh_rent_20to25_perc_income',
+                     'hh_rent_25to30_perc_income',
+                     'hh_rent_30to35_perc_income',
+                     'hh_rent_35to40_perc_income',
+                     'hh_rent_40to45_perc_income',
+                     'hh_rent_45to50_perc_income',
+                     'hh_rent_over50_perc_income']
+
+        for i in rent_cols:
+            census['perc_' + i] = census[i + 'E'] / census.hh_rentE
+
+        # Health insurance columns
+        census['perc_health_ins_private'] = (
+                                                    census.num_per_native_health_ins_privateE + census.num_per_foreign_natur_health_ins_privateE + census.num_per_foreign_noncit_health_ins_privateE) / census.num_perE
+        census['perc_health_ins_private'] = (
+                                                    census.num_per_native_health_ins_publicE + census.num_per_foreign_natur_health_ins_publicE + census.num_per_foreign_noncit_health_ins_publicE) / census.num_perE
+        census['perc_health_ins_private'] = (
+                                                    census.num_per_native_no_health_insE + census.num_per_foreign_natur_no_health_insE + census.num_per_foreign_noncit_no_health_insE) / census.num_perE
+        census['perc_native'] = census.num_per_nativeE / census.num_perE
+        census['perc_foreign_natur'] = census.num_per_foreign_naturE / census.num_perE
+        census['perc_foreign_noncit'] = census.num_per_foreign_noncitE / census.num_perE
+
+        # Work transportation columns
+        census['perc_work_transp_car'] = census.work_transp_carE / census.work_transpE
+        census['perc_work_transp_public'] = census.work_transp_publicE / census.work_transpE
+
+        # Number of household workers columns
+        worker_cols = [i for i in census.columns if ('hh_workers_' in i) and ('E' in i)]
+        census['hh_workers_total'] = census[worker_cols].sum(axis=1)
+        for i in worker_cols:
+            census['perc_' + i] = census[i] / census['hh_workers_total']
+
+        # Occupation columns
+        occup_cols = [i for i in census.columns if ('occup_' in i) and ('E' in i)]
+        for i in occup_cols:
+            census['perc' + i] = census[i] / census.occupE
+
+        # Poverty level
+        census['perc_poverty_lev_below'] = census.poverty_lev_belowE / census.poverty_levE
+
+        # Received welfare
+        census['perc_hh_welfare_received'] = census.hh_welfare_receivedE / census.hh_welfareE
+
+        # Internet columns
+        census['hh_internet_subscrip'] = census.hh_internet_subscripE / census.hh_internetE
+        census['hh_internet_no_subscrip'] = census.hh_internet_no_subscripE / census.hh_internetE
+        census['hh_internet_no_access'] = census.hh_internet_no_accessE / census.hh_internetE
+
+        # Race columns
+        race_cols = [i for i in census.columns if ('hh_race_' in i) and ('E' in i)]
+        for i in race_cols:
+            census['perc' + i] = census[i] / census.hh_raceE
+
+        # Ratio of income to poverty level columns
+        inc_to_pov_cols = [i for i in census.columns if ('hh_inc_to_pov_' in i) and ('E' in i)]
+        census['hh_inc_to_pov_lev_total'] = census[inc_to_pov_cols].sum(axis=1)
+        for i in inc_to_pov_cols:
+            census['perc_' + i] = census[i] / census['hh_inc_to_pov_lev_total']
+
+        # Adjust columns
+        cen_cols = [i for i in census.columns if (('perc_' in i) and not ('_perc_' in i)) or (
+                ('E' in i) and (('median' in i) or ('gini_' in i) or ('avg' in i)))]
+        all_cols = ['name', 'state', 'county', 'tract', 'GEOID', 'year']
+        all_cols.extend(cen_cols)
+        census = census[all_cols]
+        census.columns = [re.sub('E$', '', i) for i in census.columns]
+    ####SUCCESS-SNS-NOTIFICATION ACTIVATED#####    
+        send_sns_success()
+        return census
+    ####ERROR -SNS NOTIFICATION ACTIVATED#####
+    except IndexError as index_error:
+        send_error_sns("UNABLE_TRANF_FILE", "TECHNICAL_ERROR", "FILE_PROC_ERRORS", error_message=str(index_error))
+    except Exception as e:
+         send_error_sns("SYSTEM_ERRORS", "TECHNICAL_ERROR", "LAMBDA_ERRORS", error_message=str(e))
+         
+###BUCKETDETAILS FOR WRITING PARQUET FILES###
+s3_bucket = "dsm-datalake-s3-bucket-dev"
+s3_prefix = "Datalake_Raw/Census/Census_acs_5yr"
+s3_prefix1 = "Datalake_Raw/Census/Census_acs_features"
+datestr, timestr = get_datetime()
+fname = f"CENSUS_ACS_5YR_{datestr}_{timestr}"
+fname1 = f"CENSUS_ACS_FEATURES_{datestr}_{timestr}"
+file_prefix = "/".join([s3_prefix, fname])
+file_prefix1 = "/".join([s3_prefix1, fname1])
+
+
+def lambda_handler(event, context):
+    ####API ERROR EXCEPTION HANDLING####
+    try:
+        d = get_census_data(c)
+    except Exception as e:
+        Error_message=constant.ERROR_MSG
+        send_error_sns("API KEY_ERRORS", "AUTH_ERROR", "API_ERRORS", error_message=Error_message)
+    df1 = transform_census_data(d)
+    # df1=df1.fillna(value=np.nan)
+    print(type(df1))
+    out_buffer = BytesIO()
+    out_buffer1 = BytesIO()
+    d.to_parquet(out_buffer)
+    df1.to_parquet(out_buffer1)
+    s3_resource.Object(s3_bucket, file_prefix).put(Body=out_buffer.getvalue())
+    s3_resource.Object(s3_bucket, file_prefix1).put(Body=out_buffer1.getvalue())
+    print("parquet files Written ")
+        # TODO implement
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Success!')
+    }
+-------------------------
+
+import datetime 
+def get_datetime():
+    dt1 = datetime.datetime.now()
+    return dt1.strftime("%d %B, %Y")
+monthstr = get_datetime()
+ERRORNOTIFICATIONARN = '/datalake/sns/errornotificationarn'
+SUCCESSNOTIFICATIONARN='/datalake/sns/successnotificationarn'
+COMPONENT_NAME = 'DL_LAMBDA_CENSUS_EXTRACT'
+ERROR_MSG = f'NEED ATTENTION ****API ERROR /KEY EXPIRED ** ON {monthstr} ******'
+SUCCESS_MSG = f'SUCCESSFULLY EXTRACTED CENSUS FILES FOR {monthstr}***'
+SUCCESS_DESCRIPTION='SUCCESS'
+ENVIRONMENT = '/matillion/environment'
+------------------------------
+
+kinesis
+
+#import json
+#from __future__ import print_function
+#import base64
+
+import sys
+import logging
+import psycopg2
+import boto3
+import json
+import random
+import calendar
+import time
+from datetime import datetime
+#from psycopg2.extras import LogicalReplicationConnection
+
+
+#def lambda_handler(event, context):
+    # TODO implement
+#    return {
+#        'statusCode': 200,
+#        'body': json.dumps('Hello from Lambda!')
+#    }
+
+
+#def lambda_handler(event, context):
+#    for record in event['Records']:
+#       #Kinesis data is base64 encoded so decode here
+#       payload=base64.b64decode(record["kinesis"]["data"])
+#       print("Decoded payload: " + str(payload))
+       
+kinesis_client = boto3.client('kinesis', region_name='us-east-2')
+
+#my_connection  = psycopg2.connect("dbname='postgres' host='oms-dev-pge.ctkndbmfsp2d.us-west-2.rds.amazonaws.com' user='omspostgres' password='omspostgres'" )
+
+con_source='dbname=postgres user=omspostgres password=omspostgres host=oms-dev-pge.ctkndbmfsp2d.us-west-2.rds.amazonaws.com port=5432'
+my_connection=psycopg2.connect(con_source)
+
+def lambda_handler(event, context):
+    cur = my_connection.cursor()
+    #cur.create_replication_slot('wal2json_oms_slot', output_plugin = 'wal2json')
+    #cur.start_replication(slot_name = 'wal2json_oms_slot', options = {'pretty-print' : 1}, decode= True)
+    #cur.consume_stream(consume)
+    
+def consume(msg):
+    kinesis_client.put_record(StreamName=datalake-outage-notification, Data=json.dumps(msg.payload), PartitionKey="default")
+    print (msg.payload)
+#######
+
+cursor = context.cursor()
+cursor.execute("select table_name \
+from information_schema.tables \
+where table_type = 'BASE TABLE' and table_schema='WAREHOUSE'")
+table_list=cursor.fetchall()
+table_list=[str(''.join(x)) for x in table_list]
+#table_list=['hub_cust_service_point_test']
+for tablename in table_list:
+  if not('DL' in tablename or 'BKP' in tablename or 'ETL' in tablename or 'CRAFT' in tablename):
+    print tablename
+    try:
+      cursor.execute("alter table warehouse.{} add column ETL_CREATE_TIMESTAMP TIMESTAMP_NTZ(9)".format(tablename))
+      cursor.execute("alter table warehouse.{} add column ETL_UPDATE_TIMESTAMP TIMESTAMP_NTZ(9)".format(tablename))
+      cursor.execute("alter table warehouse.{} add column LOADED_BY VARCHAR(100)".format(tablename))
+    except:
+      print 'Updated Already'
+      continue
+
+
+  
+
+
+######################
+
+CREATE OR REPLACE  PIPE LANDINGTEMP.PIPE_PHISHING_EMAIL_STG
+AUTO_INGEST=TRUE 
+AS
+COPY INTO
+LANDINGTEMP.PHISHING_EMAIL_STG
+FROM
+(SELECT
+'I',
+CURRENT_TIMESTAMP(), 
+$1,
+$2,
+$3,
+$4,
+$5,
+TO_TIMESTAMP($6,'YYYY-MM-DD HH24:MI:SS UTC') AS DATE_EMAIL_OPENED,
+$7,
+TO_TIMESTAMP($8,'YYYY-MM-DD HH24:MI:SS UTC') AS DATE_CLICKED,
+$9,
+$10,
+$11,
+$12,
+$13,
+$14,
+$15,
+$16,
+$17,
+$18,
+$19,
+$20,
+$21,
+$22,
+$23,
+$24,
+$25,
+$26,
+$27,
+$28,
+$29,
+$30,
+$31,
+$32,
+$33,
+$34,
+$35,
+$36,
+$37,
+$38,
+$39,
+$40,
+$41,
+$42,
+$43,
+$44,
+$45,
+$46,
+$47,
+$48,
+$49,
+$50,
+$51,
+$52,
+$53,
+$54,
+$55,
+$56,
+$57,
+$58,
+$59,
+$60,
+$61,
+$62,
+$63,
+$64,
+$65,
+$66,
+$67,
+$68,
+$69,
+$70,
+$71,
+$72,
+$73,
+$74,
+$75
+FROM  @PUBLIC.DMS_S3_SOURCE_DATA_ENC/Datalake_Raw/Cyber-Proofpoint/
+)
+FILE_FORMAT=(TYPE=CSV FIELD_OPTIONALLY_ENCLOSED_BY='"' 
+FIELD_DELIMITER = "," SKIP_HEADER=1);
+
+################3
+
+TASK 
+
+REATE OR REPLACE TASK LANDINGTEMP.TASK_PHISHING_EMAIL
+	WAREHOUSE=DATA_INGESTION
+	SCHEDULE='USING CRON 0 0 * * * America/Los_Angeles'
+	AS CALL STAGING.PROC_MERGE_CDC('CYBER','PHISHING_EMAIL','LANDINGTEMP','PHISHING_EMAIL_STG',
+	   'PHISHING_EMAIL_SWAP','EMAIL_ADDRESS,CAMPAIGN_TITLE,DATE_SENT','Y',CURRENT_DATABASE(),'PHISHING_EMAIL_SEQ');
+
+ALTER TASK LANDINGTEMP.TASK_PHISHING_EMAIL RESUME;
+-------------
+
+
+
+df 1 = date dimesions + other columns 
+df2 = df1/weeknumber 
+Customer = df1 +df4
+
+sales date,  quantity, product id 
+                               iphone 
+df1 = spark.sql ( select sales date , procudct id from table name group by producti) 
+a=[100,5,82,....]
+for i in a:
+id a[i]=5 :
+print (yes)
+
+--------------
+mongodb
+from datetime import datetime
+import pymongo
+myclient = pymongo.MongoClient("mongodb://localhost:27017/")
+mydb = myclient["guid"]
+mycol = mydb["guid_repo"]
+mycol1=mydb["golden_repo"]
+query = {"GUID": '4567'}
+result = mycol1.delete_many(query)
+result = mycol.delete_many(query)
+query = {"GUID": '1234'}
+result = mycol1.delete_many(query)
+result = mycol.delete_many(query)
+
+mylist1 = [
+{"GUID":"1234","domain":"person","Source":"Siebel","Primary_Key":"S123","Fname":"John","Lname":"Doe","address": [{"address_type": "Primary","address_line_1": "4D Ag Lavras st","city": "Kifissia","postal_code": "14561","country": "Greece"},{"address_type": "Work","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"}],"Phone":["123-456-7809","234-456-6789"],"Email":[{"type":"Primary","emailadd":"John.doe@abc.com"},{"type":"alternate","emailadd":["j.doe@abc.com","john.d@xyz.com"]}],"degree":"PHD","isMember":"Y","okToCall":"N","Publication":3,"Consolidation_Ind":4},
+{"GUID":"1234","domain":"person","Source":"Author","Primary_Key":"A123","Fname":"J","Lname":"Doe","address": [{"address_type": "Primary","address_line_1": "4D Ag Lavras st","city": "Kifissia","postal_code": "14561","country": "Greece"},{"address_type": "Work","address_line_1": "xyz Ag Lavras st","city": "Madurai","postal_code": "141561","country": "India"}],"Phone":"123-456-7809","Email":[{"type":"Primary","emailadd":"j.doe@abc.com"},{"type":"alternate","emailadd":"john.d@author.com"}],"degree":["BS","MS"],"okToCall":"N","Publication":1,"Consolidation_Ind":4},
+{"GUID":"1234","domain":"person","Source":"Marketto","Primary_Key":"M123","Fname":"John","Lname":"Doe","address": [{"address_type": "Primary","address_line_1": "4D Ag Lavras st","city": "Kifissia","postal_code": "14561","country": "Greece"},{"address_type": "Work","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"}],"Phone":["342-876-9087","234-456-6789"],"Email":[{"type":"Primary","emailadd":"John.doe@abc.com"}],"isMember":"N","okToCall":"Y","Consolidation_Ind":4},
+{"GUID":"1234","domain":"person","Source":"Reviewer","Primary_Key":"R123","Fname":"Jon","Lname":"Doe","address": [{"address_type": "Primary","address_line_1": "4D Ag Lavras st","city": "Kifissia","postal_code": "14561","country": "Greece"},{"address_type": "Work","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"}],"Phone":"234-456-6789","Email":[{"type":"Primary","emailadd":"John.doe@abc.com"},{"type":"alternate","emailadd":"jon.Doe123@test.com"}],"degree":"MS","isMember":"N","Publication":1,"Consolidation_Ind":4},
+{"GUID":"4567","domain":"person","Source":"Author","Primary_Key":"A56789","Fname":"Peter","Lname":"Parker","address": [{"address_type": "Primary","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"},{"address_type": "Work","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"}],"Phone":["309-309-3098","409-409-4890"],"Email":[{"type":"Primary","emailadd":"peter.parker@spider.com"},{"type":"alternate","emailadd":["p.parker@azas.com","peter.p@xyz.com"]}],"degree":"Btech","isMember":"","okToCall":"Y","Consolidation_Ind":4},
+{"GUID":"4567","domain":"person","Source":"Marketto","Primary_Key":"A56789","Fname":"Peter S","Lname":"Parker","address": [{"address_type": "Primary","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"},{"address_type": "Work","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"}],"Phone":"409-409-4890","Email":[{"type":"Primary","emailadd":"p.parker@azas.com"}],"degree":"Mtech","isMember":"N","Publication":2,"Consolidation_Ind":4},
+{"GUID":"4567","domain":"person","Source":"IEEE Apps","Primary_Key":"IA3456","Fname":"P","Lname":"Park","address": [{"address_type": "Primary","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"},{"address_type": "Work","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"}],"Phone":["309-309-3098","1800-call-spiderman"],"Email":[{"type":"Primary","emailadd":"peter.parker@spider.com"},{"type":"alternate","emailadd":"peter.p@xyz.com"}],"Consolidation_Ind":4},
+{"GUID":"4567","domain":"person","Source":"CEEvents","Primary_Key":"CE5678909","Fname":"Pete","Lname":"Park","address": [{"address_type": "Primary","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"},{"address_type": "Work","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"}],"Phone":["345-0987-1234","890-090-0987"],"Email":[{"type":"Primary","emailadd":"p.parker@azas.com"},{"type":"alternate","emailadd":"pete.p@abcxyz.com"}],"degree":"Mtech","isMember":"","okToCall":"Y","Publication":1,"Consolidation_Ind":4},
+{"GUID":"4567","domain":"person","Source":"OpenWater","Primary_Key":"OW56789","Fname":"Petey","Lname":"Parke","address": [{"address_type": "Primary","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"},{"address_type": "Work","address_line_1": "4DD Ag Lavras st","city": "KKifissia","postal_code": "141561","country": "GGreece"}],"Phone":"309-309-3098","dateofBirth":"08/01/1962","Email":[{"type":"alternate","emailadd":"stan.lee@comic.com"}],"isMember":"","okToCall":"Y","organization":"Marvel","Consolidation_Ind":4}]
+# x = mycol.insert_many(mylist1)
+# da = datetime.now().strftime("%Y-%m-%d_%I:%M:%S_%p")
+# mycol.update_many({},{"$set": { "lastUpdated" :da }})
+#mycol.update_many({},{"$set": { "oldguid" :'' }})
+mylist2=[{'GUID': '1234', 'source_name': 'temp_golden', 'Fname': 'John', 'Lname': 'Doe', 'Email': [{'type': 'Primary', 'emailadd': ['John.doe@abc.com', 'j.doe@abc.com']}, {'type': 'alternate', 'emailadd': ['jon.Doe123@test.com', 'john.d@xyz.com', 'j.doe@abc.com', 'john.d@author.com']}], 'Phone': ['123-456-7809', '234-456-6789', '342-876-9087'], 'address': [{'address_type': 'Work', 'address_line_1': 'xyz Ag Lavras st', 'city': 'Madurai', 'postal_code': '141561', 'country': 'India'}, {'address_type': 'Work', 'address_line_1': '4DD Ag Lavras st', 'city': 'KKifissia', 'postal_code': '141561', 'country': 'GGreece'}, {'address_type': 'Primary', 'address_line_1': '4D Ag Lavras st', 'city': 'Kifissia', 'postal_code': '14561', 'country': 'Greece'}], 'isMember': 'Y', 'okToCall': 'N', 'Publication': 5}, {'GUID': '4567', 'source_name': 'temp_golden', 'Fname': 'Peter S', 'Lname': 'Parker', 'Email': [{'type': 'Primary', 'emailadd': ['p.parker@azas.com', 'peter.parker@spider.com']}, {'type': 'alternate', 'emailadd': ['peter.p@xyz.com', 'stan.lee@comic.com', 'p.parker@azas.com', 'pete.p@abcxyz.com']}], 'Phone': ['1800-call-spiderman', '309-309-3098', '345-0987-1234', '409-409-4890', '890-090-0987'], 'address': [{'address_type': 'Primary', 'address_line_1': '4DD Ag Lavras st', 'city': 'KKifissia', 'postal_code': '141561', 'country': 'GGreece'}, {'address_type': 'Work', 'address_line_1': '4DD Ag Lavras st', 'city': 'KKifissia', 'postal_code': '141561', 'country': 'GGreece'}], 'isMember': 'N', 'okToCall': 'Y', 'Publication': 3}]
+#y =  mycol1.insert_many(mylist2)
+#mycol1.update_many({},{"$set": { "unmerge" :'' }})
+
+
+
+----------
+
+import pymongo
+from pymongo import MongoClient, UpdateOne, UpdateMany
+from pprint import pprint
+import pandas as pd
+from pandas import DataFrame
+import json
+import numpy as np
+from datetime import datetime
+#import Consonants as cs
+myclient = pymongo.MongoClient("mongodb://localhost:27017/")
+mydb = myclient["guid"]
+mydb2 = myclient["Person"]
+mycol2 = mydb2["Domain_Master"]
+mycol = mydb["golden_repo"]
+mycol1=mydb["guid_repo"]
+cur=mycol1.find()
+list_cur=list(cur)
+#Before unmerge operation
+guid_df=pd.DataFrame(list_cur)
+print(guid_df)
+# getting the input file from the collection ##
+
+def getfilepath():
+    a=mycol2.find({},{'domain_id':1,'IBUCKETPATH':1})
+    path=[]
+    for data in a:
+        c=((data['IBUCKETPATH']))
+        path.append(str(c))
+        print(type(path))
+        path1=' '.join(map(str, path))
+        print(type(path1))
+        return path1
+a=getfilepath()
+def inputid(a):
+    data=open(a,'r')
+    input_df = pd.read_csv(data)
+    print(input_df)
+    a = input_df['GUID'].tolist()
+    print(a)
+    golden_df = pd.DataFrame(list_cur)
+    print(golden_df)
+    b = golden_df['GUID'].tolist()
+    print(b)
+    c = [int(x) for x in b]
+    #Comparing two lists#
+    merge_guid = []
+    for i in a:
+        if i in c:
+            print('Matched records with GR which needs to be unmerged', (i))
+            merge_guid.append(str(i))
+        else:
+            print('Records which doesnot match', (i))
+    print(type(merge_guid))
+    print(merge_guid)
+    return merge_guid
+
+
+# #Calling the input function with file as a parameter
+# #file = "D:/Users/input/guid_unmerge.txt"
+res=inputid(a)
+# #
+# #
+class unmerge:
+    def __init__(self,id):
+        self.id=id
+
+    #Function for adding the flag field  for the GUIDS unmerge
+    def unmerge_golden(self):
+        for item in self.id:
+            filter, update = {"GUID": item}, {"$set": {"unmerge": "yes"}}
+            mycol.update_many(filter, update)
+            print("Unmerged Record {} Updated in Mongodb".format(item))
+
+# Function for removing  the  indicator fields and updating them with respect to the unmergedGUID
+    def unmerge_remove_ind_guid(self):
+        # col_name = 'Consolidation_Ind'
+        for item in self.id:
+            filter, update = {"GUID": item}, {'$unset': {'Consolidation_Ind': " "}}
+            # db.testcollection.update_many({}, {"$unset": {f"{col_name}": 1}})
+            mycol1.update_many(filter, update)
+            # { $unset: {name: "", weight: ""}}
+            print("Removed the consolidationindicatorof {} and Updated in Mongodb".format(item))
+
+# Function for adding the OLD GUID fields and updating unmerged GUIDS
+    def unmerge_guidrepo_update_oldguid(self):
+        for item in self.id:
+            filter, update = {"GUID": item}, {"$set": {"OLDGUID": item}}
+            mycol1.update_many(filter, update)
+            print("Updated oldguid {} in Mongodb".format(item))
+# Function for emptying the  GUID fields and updating them with respect to the unmergedGUID
+    def unmerge_empty_guid(self):
+        for item in self.id:
+            filter, update = {"GUID": item}, {"$set": {"GUID": " "}}
+            mycol1.update_many(filter, update)
+            print("Removed the oldguid {} and Updated in Mongodb".format(item))
+def main():
+    a = unmerge(inputid(getfilepath()))
+    a.unmerge_golden()
+    a.unmerge_remove_ind_guid()
+    a.unmerge_guidrepo_update_oldguid()
+    a.unmerge_empty_guid()
+main()
+
+---------------
+
+import Updated_Golden_Unmerge as gu
+import pymongo
+from pymongo import MongoClient, UpdateOne, UpdateMany
+import pandas as pd
+import Consonants as cs
+myclient = pymongo.MongoClient("mongodb://localhost:27017/")
+mydb2 = myclient["Person"]
+mycol2 = mydb2["Domain_Master"]
+mydb = myclient["guid"]
+mycol = mydb["golden_repo"]
+mycol1=mydb["guid_repo"]
+cur=mycol1.find()
+list_cur=list(cur)
+#Writing the file in json after unmerge operation
+df=pd.DataFrame(list_cur)
+print(df)
+def getfilepathfrwrite():
+    a=mycol2.find({},{'domain_id':1,'WBUCKETPATH':1})
+    ## domain_id which will be obtained
+    path=[]
+    for data in a:
+        c=((data['WBUCKETPATH']))
+        path.append(str(c))
+        print(type(path))
+        path1=' '.join(map(str, path))
+        print(type(path1))
+        return path1
+writebucketpath= getfilepathfrwrite()
+
+def writejson(writebucketpath):
+    df = pd.DataFrame(list_cur)
+    df.to_json(writebucketpath,default_handler=str, orient = 'records')
+    print('files written')
+    return df
+#Calling the function
+writejson(writebucketpath)
+
+# Function for removing the UnMerged records in the Golden Repository
+class remove_unmerge:
+    def __init__(self,id):
+        self.id=id
+        #self.file=file
+    def unmerge_delete_guid(self):
+        for item in self.id:
+          query = {"OLDGUID": item}
+          result = mycol1.delete_many(query)
+          print("records {} deleted".format(item))
+          print("docs deleted:", result.deleted_count)
+          #print("Removed the UNMERGED GUID {}  in GOLDEN REPO COLLECTION".format(item))
+
+
+def unmerge_delete_guids():
+    #file = "D:/Users/input/guid_unmerge.txt"
+    b =remove_unmerge(gu.res)
+    b.unmerge_delete_guid()
+#Calling the  function
+unmerge_delete_guids()
+
+
+
+
+    
