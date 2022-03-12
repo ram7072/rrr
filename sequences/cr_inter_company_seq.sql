@@ -1,0 +1,1 @@
+create or replace sequence FINANCE.CR_INTER_COMPANY_SEQ start with -9223372036854775807 increment by 1;

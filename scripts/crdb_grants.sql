@@ -1,0 +1,12 @@
+grant usage on  schema CRDB to role olap_rw;
+grant create table on  schema CRDB to role olap_rw;
+grant usage on schema CRDB to role olap_ro;
+grant usage on  schema DM_CUSTOMER to role olap_ro;
+grant select on  future tables in schema crdb to role olap_ro;
+grant select on  future views in schema crdb to role olap_ro;
+grant select on  future external tables in schema crdb to role olap_ro;
+grant select on  future tables in schema DM_CUSTOMER to role olap_ro;
+grant select on  future views in schema DM_CUSTOMER to role olap_ro;
+grant select on  future external tables in schema DM_CUSTOMER to role olap_ro;
+grant usage on  schema DM_CUSTOMER to role customer_it;
+grant select on  future views in schema DM_CUSTOMER to role customer_it;
