@@ -1,0 +1,15 @@
+#Assignment1
+a = "Hello World! Hello Raja"
+print(a.split(", "))
+print(a.split(" "))
+#output:"Hello World!, Hello Raja"
+
+
+#Assignment2
+a = "Raja Raman is working in LNT INFOTECH"
+#output:[R:2,a:6,..........] > 
+#output:vowel count in a
+[a:4,e:0,i:2,o:2,u:0]
+
+#Assignment3
+Converting Tuple into List without inbuild function.
